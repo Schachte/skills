@@ -9,6 +9,7 @@ import {
   getDeselectedEnabledSkillNames,
   getEnabledNamesForSource,
   getExternalInstalledSkills,
+  getExternalSkillStateChanges,
   getWellKnownOwnershipSource,
   getRepositoryOwnershipSource,
   getLockSource,
@@ -732,6 +733,12 @@ describe('getDeselectedEnabledSkillNames', () => {
       'one',
     ]);
   });
+
+  it('does not remove a deselected skill whose name collides with an external skill', () => {
+    expect(
+      getDeselectedEnabledSkillNames(skills, [], (skill) => skill.name, ['plugin-review'])
+    ).toEqual(['one']);
+  });
 });
 
 describe('getEnabledNamesForSource', () => {
@@ -809,6 +816,45 @@ describe('getExternalInstalledSkills', () => {
     };
 
     expect(getExternalInstalledSkills(installed, entries, 'owner/current')).toEqual(installed);
+  });
+});
+
+describe('getExternalSkillStateChanges', () => {
+  const enabled = {
+    name: 'enabled',
+    description: '',
+    path: '/enabled',
+    enabled: true,
+    hasDisabledCopies: false,
+  };
+  const disabled = {
+    name: 'disabled',
+    description: '',
+    path: '/disabled',
+    enabled: false,
+    hasDisabledCopies: true,
+  };
+
+  it('disables every enabled external skill when none are selected', () => {
+    expect(getExternalSkillStateChanges([enabled, disabled], [])).toEqual({
+      enable: [],
+      disable: ['enabled'],
+    });
+  });
+
+  it('enables disabled external skills when selected', () => {
+    expect(getExternalSkillStateChanges([enabled, disabled], [enabled, disabled])).toEqual({
+      enable: ['disabled'],
+      disable: [],
+    });
+  });
+
+  it('restores disabled copies when an external skill is partially enabled', () => {
+    const partial = { ...enabled, hasDisabledCopies: true };
+    expect(getExternalSkillStateChanges([partial], [partial])).toEqual({
+      enable: ['enabled'],
+      disable: [],
+    });
   });
 });
 

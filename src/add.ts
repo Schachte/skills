@@ -13,11 +13,9 @@ import {
   installBlobSkillForAgent,
   isSkillInstalled,
   getCanonicalPath,
-  listInstalledSkills,
   installWellKnownSkillForAgent,
   sanitizeName,
   type InstallMode,
-  type InstalledSkill,
 } from './installer.ts';
 import { removeCommand } from './remove.ts';
 import {
@@ -54,6 +52,11 @@ import {
   readSkillLock,
 } from './skill-lock.ts';
 import { addSkillToLocalLock, computeSkillFolderHash, readLocalLock } from './local-lock.ts';
+import {
+  listGlobalSkillStates,
+  setGlobalSkillEnabled,
+  type GlobalSkillState,
+} from './global-skill-state.ts';
 import type { Skill, AgentType } from './types.ts';
 import {
   tryBlobInstall,
@@ -640,13 +643,33 @@ async function externalInstalledSkillsForSource(
   global: boolean,
   managesEnabledState: boolean,
   source: string
-): Promise<InstalledSkill[]> {
+): Promise<GlobalSkillState[]> {
   if (!global || !managesEnabledState) return [];
-  const [installedSkills, lock] = await Promise.all([
-    listInstalledSkills({ global: true }),
-    readSkillLock(),
-  ]);
+  const [installedSkills, lock] = await Promise.all([listGlobalSkillStates(), readSkillLock()]);
   return getExternalInstalledSkills(installedSkills, lock.skills, source);
+}
+
+export function getExternalSkillStateChanges(
+  externalSkills: GlobalSkillState[],
+  selectedValues: unknown[]
+): { enable: string[]; disable: string[] } {
+  const selected = new Set(selectedValues);
+  return {
+    enable: externalSkills
+      .filter((skill) => skill.hasDisabledCopies && selected.has(skill))
+      .map((s) => s.name),
+    disable: externalSkills
+      .filter((skill) => skill.enabled && !selected.has(skill))
+      .map((s) => s.name),
+  };
+}
+
+async function applyExternalSkillStateChanges(changes: {
+  enable: string[];
+  disable: string[];
+}): Promise<void> {
+  for (const name of changes.disable) await setGlobalSkillEnabled(name, false);
+  for (const name of changes.enable) await setGlobalSkillEnabled(name, true);
 }
 
 function isGitHubSshSource(source: string): boolean {
@@ -694,11 +717,16 @@ function isEnabled(name: string, enabledNames: Set<string>): boolean {
 export function getDeselectedEnabledSkillNames<T>(
   enabledSkills: T[],
   selectedSkills: T[],
-  getName: (skill: T) => string
+  getName: (skill: T) => string,
+  protectedNames: Iterable<string> = []
 ): string[] {
   const selectedNames = new Set(selectedSkills.map((skill) => sanitizeName(getName(skill))));
+  const protectedNameSet = new Set(Array.from(protectedNames, sanitizeName));
   return enabledSkills
-    .filter((skill) => !selectedNames.has(sanitizeName(getName(skill))))
+    .filter((skill) => {
+      const name = sanitizeName(getName(skill));
+      return !protectedNameSet.has(name) && !selectedNames.has(name);
+    })
     .map(getName);
 }
 
@@ -795,6 +823,7 @@ async function handleWellKnownSkills(
     externalSkills.map((skill) => [sanitizeName(skill.name), skill])
   );
   let skillsToDisable: string[] = [];
+  let externalChanges: { enable: string[]; disable: string[] } = { enable: [], disable: [] };
 
   // Filter skills if --skill option is provided
   let selectedSkills: WellKnownSkill[];
@@ -834,7 +863,7 @@ async function handleWellKnownSkills(
       ...skills.map((s) => {
         const external = externalSkillsByName.get(sanitizeName(s.installName));
         return {
-          value: s as WellKnownSkill | InstalledSkill,
+          value: external ?? s,
           label: s.installName,
           hint: s.description.length > 60 ? s.description.slice(0, 57) + '…' : s.description,
           detail: external ? `Installed outside this source at ${external.path}` : s.description,
@@ -843,14 +872,13 @@ async function handleWellKnownSkills(
             : isEnabled(s.installName, enabledNames)
               ? 'enabled'
               : undefined,
-          readOnly: Boolean(external),
         };
       }),
       ...externalSkills
         .filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name)))
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((skill) => ({
-          value: skill as WellKnownSkill | InstalledSkill,
+          value: skill,
           label: skill.name,
           hint:
             skill.description.length > 60
@@ -858,16 +886,27 @@ async function handleWellKnownSkills(
               : skill.description,
           detail: `${skill.description || 'Installed skill'} (${skill.path})`,
           status: 'external',
-          readOnly: true,
         })),
     ];
 
-    const selected = await searchMultiselect<WellKnownSkill | InstalledSkill>({
+    const selected = await searchMultiselect<WellKnownSkill | GlobalSkillState>({
       message: `Select enabled ${installGlobally ? 'global' : 'project'} skills`,
       items: skillChoices,
       initialSelected: isSkillsShPackUrl(url)
-        ? Array.from(new Set([...skills, ...enabledSkills]))
-        : enabledSkills,
+        ? Array.from(
+            new Set([
+              ...skills.filter(
+                (skill) => !externalSkillsByName.has(sanitizeName(skill.installName))
+              ),
+              ...externalSkills.filter((skill) => skill.enabled),
+            ])
+          )
+        : [
+            ...enabledSkills.filter(
+              (skill) => !externalSkillsByName.has(sanitizeName(skill.installName))
+            ),
+            ...externalSkills.filter((skill) => skill.enabled),
+          ],
       required: false,
       maxVisible: 20,
       selectAll: true,
@@ -878,29 +917,44 @@ async function handleWellKnownSkills(
       process.exit(0);
     }
 
-    selectedSkills = (selected as Array<WellKnownSkill | InstalledSkill>).filter(
-      (skill): skill is WellKnownSkill => skills.includes(skill as WellKnownSkill)
+    const selectedValues = selected as Array<WellKnownSkill | GlobalSkillState>;
+    selectedSkills = selectedValues.filter((skill): skill is WellKnownSkill =>
+      skills.includes(skill as WellKnownSkill)
     );
+    externalChanges = getExternalSkillStateChanges(externalSkills, selectedValues);
     skillsToDisable = getDeselectedEnabledSkillNames(
       enabledSkills,
       selectedSkills,
-      (skill) => skill.installName
+      (skill) => skill.installName,
+      externalSkills.map((skill) => skill.name)
     );
   }
 
   if (selectedSkills.length === 0) {
-    if (skillsToDisable.length === 0) {
+    if (
+      skillsToDisable.length === 0 &&
+      externalChanges.enable.length === 0 &&
+      externalChanges.disable.length === 0
+    ) {
       p.outro(pc.dim('No changes.'));
       return true;
     }
 
-    p.note(skillsToDisable.map((name) => pc.red(`Disable ${name}`)).join('\n'), 'Changes Summary');
+    p.note(
+      [
+        ...skillsToDisable.map((name) => pc.red(`Disable ${name}`)),
+        ...externalChanges.disable.map((name) => pc.red(`Disable external ${name}`)),
+        ...externalChanges.enable.map((name) => pc.green(`Enable external ${name}`)),
+      ].join('\n'),
+      'Changes Summary'
+    );
     const confirmed = await p.confirm({ message: 'Apply changes?' });
     if (p.isCancel(confirmed) || !confirmed) {
       p.cancel('Changes cancelled');
       process.exit(0);
     }
     await applySkillRemovals(skillsToDisable, installGlobally);
+    await applyExternalSkillStateChanges(externalChanges);
     p.outro(pc.green('Done!'));
     return true;
   }
@@ -1074,16 +1128,28 @@ async function handleWellKnownSkills(
     summaryLines.push(pc.bold('Disable'));
     for (const name of skillsToDisable) summaryLines.push(`  ${pc.red(name)}`);
   }
+  if (externalChanges.disable.length > 0) {
+    if (summaryLines.length > 0) summaryLines.push('');
+    summaryLines.push(pc.bold('Disable external'));
+    for (const name of externalChanges.disable) summaryLines.push(`  ${pc.red(name)}`);
+  }
+  if (externalChanges.enable.length > 0) {
+    if (summaryLines.length > 0) summaryLines.push('');
+    summaryLines.push(pc.bold('Enable external'));
+    for (const name of externalChanges.enable) summaryLines.push(`  ${pc.green(name)}`);
+  }
+
+  const hasStateChanges =
+    skillsToDisable.length > 0 ||
+    externalChanges.disable.length > 0 ||
+    externalChanges.enable.length > 0;
 
   console.log();
-  p.note(
-    summaryLines.join('\n'),
-    skillsToDisable.length > 0 ? 'Changes Summary' : 'Installation Summary'
-  );
+  p.note(summaryLines.join('\n'), hasStateChanges ? 'Changes Summary' : 'Installation Summary');
 
   if (!options.yes) {
     const confirmed = await p.confirm({
-      message: skillsToDisable.length > 0 ? 'Apply changes?' : 'Proceed with installation?',
+      message: hasStateChanges ? 'Apply changes?' : 'Proceed with installation?',
     });
 
     if (p.isCancel(confirmed) || !confirmed) {
@@ -1130,7 +1196,8 @@ async function handleWellKnownSkills(
 
   if (failed.length === 0) {
     await applySkillRemovals(skillsToDisable, installGlobally);
-  } else if (skillsToDisable.length > 0) {
+    await applyExternalSkillStateChanges(externalChanges);
+  } else if (hasStateChanges) {
     p.log.warn('Skipped disabling skills because installation did not complete successfully.');
   }
 
@@ -1558,6 +1625,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       externalSkills.map((skill) => [sanitizeName(skill.name), skill])
     );
     let skillsToDisable: string[] = [];
+    let externalChanges: { enable: string[]; disable: string[] } = { enable: [], disable: [] };
 
     let selectedSkills: Skill[];
 
@@ -1614,32 +1682,33 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         ...sortedSkills.map((s) => {
           const external = externalSkillsByName.get(sanitizeName(s.name));
           return {
-            value: s,
+            value: external ?? s,
             label: getSkillDisplayName(s),
             group: hasGroups ? (s.pluginName ? kebabToTitle(s.pluginName) : 'Other') : undefined,
             detail: external ? `Installed outside this source at ${external.path}` : s.description,
             status: external ? 'external' : isEnabled(s.name, enabledNames) ? 'enabled' : undefined,
-            readOnly: Boolean(external),
           };
         }),
         ...externalSkills
           .filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name)))
           .sort((a, b) => a.name.localeCompare(b.name))
           .map((skill) => ({
-            value: skill as Skill,
+            value: skill,
             label: skill.name,
             detail: `${skill.description || 'Installed skill'} (${skill.path})`,
             status: 'external',
-            readOnly: true,
           })),
       ];
 
-      const selected = await searchMultiselect({
+      const selected = await searchMultiselect<Skill | GlobalSkillState>({
         message: hasGroups
           ? `Select enabled ${installGlobally ? 'global' : 'project'} skills ${pc.dim('(space to toggle)')}`
           : `Select enabled ${installGlobally ? 'global' : 'project'} skills`,
         items: skillChoices,
-        initialSelected: enabledSkills,
+        initialSelected: [
+          ...enabledSkills.filter((skill) => !externalSkillsByName.has(sanitizeName(skill.name))),
+          ...externalSkills.filter((skill) => skill.enabled),
+        ],
         required: false,
         maxVisible: 20,
         searchable: !hasGroups,
@@ -1655,23 +1724,36 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         process.exit(0);
       }
 
-      selectedSkills = selected as Skill[];
+      const selectedValues = selected as Array<Skill | GlobalSkillState>;
+      selectedSkills = selectedValues.filter((skill): skill is Skill =>
+        skills.includes(skill as Skill)
+      );
+      externalChanges = getExternalSkillStateChanges(externalSkills, selectedValues);
       skillsToDisable = getDeselectedEnabledSkillNames(
         enabledSkills,
         selectedSkills,
-        (skill) => skill.name
+        (skill) => skill.name,
+        externalSkills.map((skill) => skill.name)
       );
     }
 
     if (selectedSkills.length === 0) {
-      if (skillsToDisable.length === 0) {
+      if (
+        skillsToDisable.length === 0 &&
+        externalChanges.enable.length === 0 &&
+        externalChanges.disable.length === 0
+      ) {
         p.outro(pc.dim('No changes.'));
         await cleanup(tempDir);
         return;
       }
 
       p.note(
-        skillsToDisable.map((name) => pc.red(`Disable ${name}`)).join('\n'),
+        [
+          ...skillsToDisable.map((name) => pc.red(`Disable ${name}`)),
+          ...externalChanges.disable.map((name) => pc.red(`Disable external ${name}`)),
+          ...externalChanges.enable.map((name) => pc.green(`Enable external ${name}`)),
+        ].join('\n'),
         'Changes Summary'
       );
       const confirmed = await p.confirm({ message: 'Apply changes?' });
@@ -1681,6 +1763,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         process.exit(0);
       }
       await applySkillRemovals(skillsToDisable, installGlobally);
+      await applyExternalSkillStateChanges(externalChanges);
       p.outro(pc.green('Done!'));
       await cleanup(tempDir);
       return;
@@ -2003,12 +2086,24 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       summaryLines.push(pc.bold('Disable'));
       for (const name of skillsToDisable) summaryLines.push(`  ${pc.red(name)}`);
     }
+    if (externalChanges.disable.length > 0) {
+      if (summaryLines.length > 0) summaryLines.push('');
+      summaryLines.push(pc.bold('Disable external'));
+      for (const name of externalChanges.disable) summaryLines.push(`  ${pc.red(name)}`);
+    }
+    if (externalChanges.enable.length > 0) {
+      if (summaryLines.length > 0) summaryLines.push('');
+      summaryLines.push(pc.bold('Enable external'));
+      for (const name of externalChanges.enable) summaryLines.push(`  ${pc.green(name)}`);
+    }
+
+    const hasStateChanges =
+      skillsToDisable.length > 0 ||
+      externalChanges.disable.length > 0 ||
+      externalChanges.enable.length > 0;
 
     console.log();
-    p.note(
-      summaryLines.join('\n'),
-      skillsToDisable.length > 0 ? 'Changes Summary' : 'Installation Summary'
-    );
+    p.note(summaryLines.join('\n'), hasStateChanges ? 'Changes Summary' : 'Installation Summary');
 
     // Await and display security audit results (started earlier in parallel)
     // Wrapped in try/catch so a failed audit fetch never blocks installation.
@@ -2033,7 +2128,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
     if (!options.yes) {
       const confirmed = await p.confirm({
-        message: skillsToDisable.length > 0 ? 'Apply changes?' : 'Proceed with installation?',
+        message: hasStateChanges ? 'Apply changes?' : 'Proceed with installation?',
       });
 
       if (p.isCancel(confirmed) || !confirmed) {
@@ -2098,7 +2193,8 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
     if (failed.length === 0) {
       await applySkillRemovals(skillsToDisable, installGlobally);
-    } else if (skillsToDisable.length > 0) {
+      await applyExternalSkillStateChanges(externalChanges);
+    } else if (hasStateChanges) {
       p.log.warn('Skipped disabling skills because installation did not complete successfully.');
     }
     // Track installation result
