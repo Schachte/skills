@@ -13,9 +13,11 @@ import {
   installBlobSkillForAgent,
   isSkillInstalled,
   getCanonicalPath,
+  listInstalledSkills,
   installWellKnownSkillForAgent,
   sanitizeName,
   type InstallMode,
+  type InstalledSkill,
 } from './installer.ts';
 import { removeCommand } from './remove.ts';
 import {
@@ -608,6 +610,45 @@ export function getEnabledNamesForSource(
   );
 }
 
+export function getExternalInstalledSkills<T extends { name: string }>(
+  installedSkills: T[],
+  entries: Record<
+    string,
+    {
+      source: string;
+      ownershipSource?: string;
+      sourceType?: string;
+      sourceUrl?: string;
+      sourceBaseUrl?: string;
+    }
+  >,
+  source: string
+): T[] {
+  const ownedNames = getEnabledNamesForSource(entries, source);
+  const foreignNames = new Set(
+    Object.entries(entries)
+      .filter(([name, entry]) => !getEnabledNamesForSource({ [name]: entry }, source).size)
+      .map(([name]) => sanitizeName(name))
+  );
+  return installedSkills.filter((skill) => {
+    const name = sanitizeName(skill.name);
+    return !ownedNames.has(name) || foreignNames.has(name);
+  });
+}
+
+async function externalInstalledSkillsForSource(
+  global: boolean,
+  managesEnabledState: boolean,
+  source: string
+): Promise<InstalledSkill[]> {
+  if (!global || !managesEnabledState) return [];
+  const [installedSkills, lock] = await Promise.all([
+    listInstalledSkills({ global: true }),
+    readSkillLock(),
+  ]);
+  return getExternalInstalledSkills(installedSkills, lock.skills, source);
+}
+
 function isGitHubSshSource(source: string): boolean {
   if (/^git@github\.com:/i.test(source)) return true;
   if (!source.startsWith('ssh://')) return false;
@@ -745,6 +786,14 @@ async function handleWellKnownSkills(
     ? await enabledNamesForSource(installGlobally, ownershipSource)
     : new Set<string>();
   const enabledSkills = skills.filter((skill) => isEnabled(skill.installName, enabledNames));
+  const externalSkills = await externalInstalledSkillsForSource(
+    installGlobally,
+    managesEnabledState,
+    ownershipSource
+  );
+  const externalSkillsByName = new Map(
+    externalSkills.map((skill) => [sanitizeName(skill.name), skill])
+  );
   let skillsToDisable: string[] = [];
 
   // Filter skills if --skill option is provided
@@ -771,7 +820,7 @@ async function handleWellKnownSkills(
       }
       process.exit(1);
     }
-  } else if (skills.length === 1 && enabledSkills.length === 0) {
+  } else if (skills.length === 1 && enabledSkills.length === 0 && externalSkills.length === 0) {
     selectedSkills = skills;
     const firstSkill = skills[0]!;
     p.log.info(`Skill: ${pc.cyan(firstSkill.installName)}`);
@@ -780,14 +829,40 @@ async function handleWellKnownSkills(
     p.log.info(`Installing all ${skills.length} skills`);
   } else {
     // Prompt user to select skills
-    const skillChoices = skills.map((s) => ({
-      value: s,
-      label: s.installName,
-      hint: s.description.length > 60 ? s.description.slice(0, 57) + '…' : s.description,
-      status: isEnabled(s.installName, enabledNames) ? 'enabled' : undefined,
-    }));
+    const sourceSkillNames = new Set(skills.map((skill) => sanitizeName(skill.installName)));
+    const skillChoices = [
+      ...skills.map((s) => {
+        const external = externalSkillsByName.get(sanitizeName(s.installName));
+        return {
+          value: s as WellKnownSkill | InstalledSkill,
+          label: s.installName,
+          hint: s.description.length > 60 ? s.description.slice(0, 57) + '…' : s.description,
+          detail: external ? `Installed outside this source at ${external.path}` : s.description,
+          status: external
+            ? 'external'
+            : isEnabled(s.installName, enabledNames)
+              ? 'enabled'
+              : undefined,
+          readOnly: Boolean(external),
+        };
+      }),
+      ...externalSkills
+        .filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name)))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((skill) => ({
+          value: skill as WellKnownSkill | InstalledSkill,
+          label: skill.name,
+          hint:
+            skill.description.length > 60
+              ? skill.description.slice(0, 57) + '…'
+              : skill.description,
+          detail: `${skill.description || 'Installed skill'} (${skill.path})`,
+          status: 'external',
+          readOnly: true,
+        })),
+    ];
 
-    const selected = await searchMultiselect({
+    const selected = await searchMultiselect<WellKnownSkill | InstalledSkill>({
       message: `Select enabled ${installGlobally ? 'global' : 'project'} skills`,
       items: skillChoices,
       initialSelected: isSkillsShPackUrl(url)
@@ -803,7 +878,9 @@ async function handleWellKnownSkills(
       process.exit(0);
     }
 
-    selectedSkills = selected as WellKnownSkill[];
+    selectedSkills = (selected as Array<WellKnownSkill | InstalledSkill>).filter(
+      (skill): skill is WellKnownSkill => skills.includes(skill as WellKnownSkill)
+    );
     skillsToDisable = getDeselectedEnabledSkillNames(
       enabledSkills,
       selectedSkills,
@@ -1472,6 +1549,14 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       ? await enabledNamesForSource(installGlobally, ownershipSource)
       : new Set<string>();
     const enabledSkills = skills.filter((skill) => isEnabled(skill.name, enabledNames));
+    const externalSkills = await externalInstalledSkillsForSource(
+      installGlobally,
+      managesEnabledState,
+      ownershipSource
+    );
+    const externalSkillsByName = new Map(
+      externalSkills.map((skill) => [sanitizeName(skill.name), skill])
+    );
     let skillsToDisable: string[] = [];
 
     let selectedSkills: Skill[];
@@ -1496,7 +1581,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       p.log.info(
         `Selected ${selectedSkills.length} skill${selectedSkills.length !== 1 ? 's' : ''}: ${selectedSkills.map((s) => pc.cyan(getSkillDisplayName(s))).join(', ')}`
       );
-    } else if (skills.length === 1 && enabledSkills.length === 0) {
+    } else if (skills.length === 1 && enabledSkills.length === 0 && externalSkills.length === 0) {
       selectedSkills = skills;
       const firstSkill = skills[0]!;
       p.log.info(`Skill: ${pc.cyan(getSkillDisplayName(firstSkill))}`);
@@ -1524,13 +1609,30 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
           .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
           .join(' ');
 
-      const skillChoices = sortedSkills.map((s) => ({
-        value: s,
-        label: getSkillDisplayName(s),
-        group: hasGroups ? (s.pluginName ? kebabToTitle(s.pluginName) : 'Other') : undefined,
-        detail: s.description,
-        status: isEnabled(s.name, enabledNames) ? 'enabled' : undefined,
-      }));
+      const sourceSkillNames = new Set(sortedSkills.map((skill) => sanitizeName(skill.name)));
+      const skillChoices = [
+        ...sortedSkills.map((s) => {
+          const external = externalSkillsByName.get(sanitizeName(s.name));
+          return {
+            value: s,
+            label: getSkillDisplayName(s),
+            group: hasGroups ? (s.pluginName ? kebabToTitle(s.pluginName) : 'Other') : undefined,
+            detail: external ? `Installed outside this source at ${external.path}` : s.description,
+            status: external ? 'external' : isEnabled(s.name, enabledNames) ? 'enabled' : undefined,
+            readOnly: Boolean(external),
+          };
+        }),
+        ...externalSkills
+          .filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name)))
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map((skill) => ({
+            value: skill as Skill,
+            label: skill.name,
+            detail: `${skill.description || 'Installed skill'} (${skill.path})`,
+            status: 'external',
+            readOnly: true,
+          })),
+      ];
 
       const selected = await searchMultiselect({
         message: hasGroups

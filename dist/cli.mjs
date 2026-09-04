@@ -313,7 +313,7 @@ const S_STEP_CANCEL = import_picocolors.default.red("■");
 const S_STEP_SUBMIT = import_picocolors.default.green("◇");
 const S_RADIO_ACTIVE = import_picocolors.default.green("●");
 const S_RADIO_INACTIVE = import_picocolors.default.dim("○");
-import_picocolors.default.green("✓");
+const S_CHECKBOX_LOCKED = import_picocolors.default.green("✓");
 const S_BULLET = import_picocolors.default.green("•");
 const S_BAR = import_picocolors.default.dim("│");
 const S_BAR_H = import_picocolors.default.dim("─");
@@ -411,21 +411,27 @@ function buildSearchEntries(items, selectGroups, collapsedGroups = /* @__PURE__ 
 }
 function toggleSearchEntry(selected, entry) {
 	if (entry?.type === "group") {
-		const allSelected = entry.items.every((item) => selected.has(item.value));
-		for (const item of entry.items) if (allSelected) selected.delete(item.value);
+		const selectableItems = entry.items.filter((item) => !item.readOnly);
+		if (selectableItems.length === 0) return;
+		const allSelected = selectableItems.every((item) => selected.has(item.value));
+		for (const item of selectableItems) if (allSelected) selected.delete(item.value);
 		else selected.add(item.value);
-	} else if (entry?.type === "item") if (selected.has(entry.item.value)) selected.delete(entry.item.value);
-	else selected.add(entry.item.value);
+	} else if (entry?.type === "item") {
+		if (entry.item.readOnly) return;
+		if (selected.has(entry.item.value)) selected.delete(entry.item.value);
+		else selected.add(entry.item.value);
+	}
 }
 function getSelectAllState(selected, items) {
-	const selectedCount = items.filter((item) => selected.has(item.value)).length;
+	const selectableItems = items.filter((item) => !item.readOnly);
+	const selectedCount = selectableItems.filter((item) => selected.has(item.value)).length;
 	if (selectedCount === 0) return "none";
-	if (selectedCount === items.length) return "all";
+	if (selectedCount === selectableItems.length) return "all";
 	return "partial";
 }
 function toggleAllItems(selected, items) {
 	const shouldClear = getSelectAllState(selected, items) === "all";
-	for (const item of items) if (shouldClear) selected.delete(item.value);
+	for (const item of items.filter((candidate) => !candidate.readOnly)) if (shouldClear) selected.delete(item.value);
 	else selected.add(item.value);
 }
 async function searchMultiselect(options) {
@@ -438,9 +444,10 @@ async function searchMultiselect(options) {
 		});
 		if (process.stdin.isTTY) process.stdin.setRawMode(true);
 		readline.emitKeypressEvents(process.stdin, rl);
+		const readOnlyValues = new Set(items.filter((item) => item.readOnly).map((item) => item.value));
 		let query = "";
 		let cursor = 0;
-		const selected = new Set(initialSelected);
+		const selected = new Set(initialSelected.filter((value) => !readOnlyValues.has(value)));
 		const collapsedGroups = /* @__PURE__ */ new Set();
 		let lastRenderHeight = 0;
 		const lockedValues = lockedSection ? lockedSection.items.map((i) => i.value) : [];
@@ -456,7 +463,8 @@ async function searchMultiselect(options) {
 			const lines = [];
 			const filtered = getFiltered();
 			const entries = buildSearchEntries(filtered, selectGroups, collapsedGroups);
-			const hasSelectAll = selectAll && items.length > 0;
+			const selectableItems = items.filter((item) => !item.readOnly);
+			const hasSelectAll = selectAll && selectableItems.length > 0;
 			const entryCursor = cursor - (hasSelectAll ? 1 : 0);
 			const icon = state === "active" ? S_STEP_ACTIVE : state === "cancel" ? S_STEP_CANCEL : S_STEP_SUBMIT;
 			lines.push(`${icon}  ${import_picocolors.default.bold(message)}`);
@@ -477,13 +485,13 @@ async function searchMultiselect(options) {
 					lines.push(`${S_BAR}`);
 				}
 				if (hasSelectAll) {
-					const selectedCount = items.filter((item) => selected.has(item.value)).length;
+					const selectedCount = selectableItems.filter((item) => selected.has(item.value)).length;
 					const selectAllState = getSelectAllState(selected, items);
 					const radio = selectAllState === "all" ? S_RADIO_ACTIVE : selectAllState === "partial" ? import_picocolors.default.yellow("◐") : S_RADIO_INACTIVE;
 					const isCursor = cursor === 0;
 					const prefix = isCursor ? import_picocolors.default.cyan("❯") : " ";
 					const label = isCursor ? import_picocolors.default.underline(import_picocolors.default.bold("Select All")) : import_picocolors.default.bold("Select All");
-					lines.push(`${S_BAR} ${prefix} ${radio} ${label} ${import_picocolors.default.dim(`(${selectedCount}/${items.length})`)}`);
+					lines.push(`${S_BAR} ${prefix} ${radio} ${label} ${import_picocolors.default.dim(`(${selectedCount}/${selectableItems.length})`)}`);
 					lines.push(`${S_BAR}   ${S_BAR_H.repeat(36)}`);
 				}
 				const columns = process.stdout.columns && process.stdout.columns > 0 ? process.stdout.columns : 80;
@@ -491,7 +499,7 @@ async function searchMultiselect(options) {
 					const footerLines = [];
 					if (includeDetail) {
 						const entry = entries[entryCursor];
-						const detail = hasSelectAll && cursor === 0 ? `Select or clear all ${items.length} skills.` : entry?.type === "group" ? `Select all ${entry.items.length} skills in ${entry.group}.` : entry?.item.detail;
+						const detail = hasSelectAll && cursor === 0 ? `Select or clear all ${selectableItems.length} skills.` : entry?.type === "group" ? `Select all ${entry.items.length} skills in ${entry.group}.` : entry?.item.detail;
 						const detailWidth = Math.max(1, columns - 5);
 						footerLines.push(`${S_BAR}`);
 						footerLines.push(`${S_BAR}  ${import_picocolors.default.dim("Description")}`);
@@ -499,7 +507,11 @@ async function searchMultiselect(options) {
 					}
 					if (includeSelectedSummary) {
 						footerLines.push(`${S_BAR}`);
-						const allSelectedLabels = [...lockedSection ? lockedSection.items.map((i) => i.label) : [], ...items.filter((item) => selected.has(item.value)).map((item) => item.label)];
+						const allSelectedLabels = [
+							...lockedSection ? lockedSection.items.map((i) => i.label) : [],
+							...items.filter((item) => item.readOnly).map((item) => item.label),
+							...items.filter((item) => selected.has(item.value)).map((item) => item.label)
+						];
 						if (allSelectedLabels.length === 0) footerLines.push(`${S_BAR}  ${import_picocolors.default.dim("Selected: (none)")}`);
 						else {
 							const summary = allSelectedLabels.length <= 3 ? allSelectedLabels.join(", ") : `${allSelectedLabels.slice(0, 3).join(", ")} +${allSelectedLabels.length - 3} more`;
@@ -523,8 +535,9 @@ async function searchMultiselect(options) {
 						const entry = visibleEntries[i];
 						const isCursor = visibleStart + i === entryCursor;
 						if (entry.type === "group") {
-							const selectedCount = entry.items.filter((item) => selected.has(item.value)).length;
-							const radio = selectedCount === entry.items.length ? S_RADIO_ACTIVE : selectedCount > 0 ? import_picocolors.default.yellow("◐") : S_RADIO_INACTIVE;
+							const groupItems = entry.items.filter((item) => !item.readOnly);
+							const selectedCount = groupItems.filter((item) => selected.has(item.value)).length;
+							const radio = groupItems.length === 0 ? S_CHECKBOX_LOCKED : selectedCount === groupItems.length ? S_RADIO_ACTIVE : selectedCount > 0 ? import_picocolors.default.yellow("◐") : S_RADIO_INACTIVE;
 							const label = isCursor ? import_picocolors.default.underline(import_picocolors.default.bold(entry.group)) : import_picocolors.default.bold(entry.group);
 							const prefix = isCursor ? import_picocolors.default.cyan("❯") : " ";
 							const disclosure = import_picocolors.default.dim(entry.collapsed ? "▸" : "▾");
@@ -532,7 +545,8 @@ async function searchMultiselect(options) {
 							continue;
 						}
 						const item = entry.item;
-						const radio = selected.has(item.value) ? S_RADIO_ACTIVE : S_RADIO_INACTIVE;
+						const isSelected = item.readOnly || selected.has(item.value);
+						const radio = item.readOnly ? S_CHECKBOX_LOCKED : isSelected ? S_RADIO_ACTIVE : S_RADIO_INACTIVE;
 						const label = isCursor ? import_picocolors.default.underline(item.label) : item.label;
 						const status = item.status ? ` ${import_picocolors.default.green(item.status)}` : "";
 						const hint = item.hint ? import_picocolors.default.dim(` (${item.hint})`) : "";
@@ -591,7 +605,11 @@ async function searchMultiselect(options) {
 				}
 				lines.push(...fitted.itemLines, ...fitted.footerLines);
 			} else if (state === "submit") {
-				const allSelectedLabels = [...lockedSection ? lockedSection.items.map((i) => i.label) : [], ...items.filter((item) => selected.has(item.value)).map((item) => item.label)];
+				const allSelectedLabels = [
+					...lockedSection ? lockedSection.items.map((i) => i.label) : [],
+					...items.filter((item) => item.readOnly).map((item) => item.label),
+					...items.filter((item) => selected.has(item.value)).map((item) => item.label)
+				];
 				lines.push(`${S_BAR}  ${import_picocolors.default.dim(allSelectedLabels.join(", "))}`);
 			} else if (state === "cancel") lines.push(`${S_BAR}  ${import_picocolors.default.strikethrough(import_picocolors.default.dim("Cancelled"))}`);
 			const clearPreviousFrame = lastRenderHeight > 0 ? `\x1b[${lastRenderHeight}A\x1b[J` : "";
@@ -607,7 +625,7 @@ async function searchMultiselect(options) {
 			if (required && selected.size === 0 && lockedValues.length === 0) return;
 			render("submit");
 			cleanup();
-			resolve([...lockedValues, ...Array.from(selected)]);
+			resolve([...lockedValues, ...Array.from(selected).filter((value) => !readOnlyValues.has(value))]);
 		};
 		const cancel = () => {
 			render("cancel");
@@ -617,7 +635,7 @@ async function searchMultiselect(options) {
 		const keypressHandler = (_str, key) => {
 			if (!key) return;
 			const entries = buildSearchEntries(getFiltered(), selectGroups, collapsedGroups);
-			const hasSelectAll = selectAll && items.length > 0;
+			const hasSelectAll = selectAll && items.some((item) => !item.readOnly);
 			const cursorOffset = hasSelectAll ? 1 : 0;
 			const entry = entries[cursor - cursorOffset];
 			if (key.name === "return") {
@@ -4521,6 +4539,19 @@ function getEnabledNamesForSource(entries, source) {
 		return (identity ?? entry.source) === source;
 	}).map(([name]) => sanitizeName(name)));
 }
+function getExternalInstalledSkills(installedSkills, entries, source) {
+	const ownedNames = getEnabledNamesForSource(entries, source);
+	const foreignNames = new Set(Object.entries(entries).filter(([name, entry]) => !getEnabledNamesForSource({ [name]: entry }, source).size).map(([name]) => sanitizeName(name)));
+	return installedSkills.filter((skill) => {
+		const name = sanitizeName(skill.name);
+		return !ownedNames.has(name) || foreignNames.has(name);
+	});
+}
+async function externalInstalledSkillsForSource(global, managesEnabledState, source) {
+	if (!global || !managesEnabledState) return [];
+	const [installedSkills, lock] = await Promise.all([listInstalledSkills({ global: true }), readSkillLock()]);
+	return getExternalInstalledSkills(installedSkills, lock.skills, source);
+}
 function isGitHubSshSource(source) {
 	if (/^git@github\.com:/i.test(source)) return true;
 	if (!source.startsWith("ssh://")) return false;
@@ -4608,8 +4639,11 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 	options.global = installGlobally;
 	const sourceIdentifier = wellKnownProvider.getSourceIdentifier(url);
 	const ownershipSource = getWellKnownOwnershipSource(url);
-	const enabledNames = !options.yes && !options.skill?.length ? await enabledNamesForSource(installGlobally, ownershipSource) : /* @__PURE__ */ new Set();
+	const managesEnabledState = !options.yes && !options.skill?.length;
+	const enabledNames = managesEnabledState ? await enabledNamesForSource(installGlobally, ownershipSource) : /* @__PURE__ */ new Set();
 	const enabledSkills = skills.filter((skill) => isEnabled(skill.installName, enabledNames));
+	const externalSkills = await externalInstalledSkillsForSource(installGlobally, managesEnabledState, ownershipSource);
+	const externalSkillsByName = new Map(externalSkills.map((skill) => [sanitizeName(skill.name), skill]));
 	let skillsToDisable = [];
 	let selectedSkills;
 	if (options.skill?.includes("*")) {
@@ -4623,7 +4657,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 			for (const s of skills) log.message(`  - ${s.installName}`);
 			process.exit(1);
 		}
-	} else if (skills.length === 1 && enabledSkills.length === 0) {
+	} else if (skills.length === 1 && enabledSkills.length === 0 && externalSkills.length === 0) {
 		selectedSkills = skills;
 		const firstSkill = skills[0];
 		log.info(`Skill: ${import_picocolors.default.cyan(firstSkill.installName)}`);
@@ -4631,12 +4665,25 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 		selectedSkills = skills;
 		log.info(`Installing all ${skills.length} skills`);
 	} else {
-		const skillChoices = skills.map((s) => ({
-			value: s,
-			label: s.installName,
-			hint: s.description.length > 60 ? s.description.slice(0, 57) + "…" : s.description,
-			status: isEnabled(s.installName, enabledNames) ? "enabled" : void 0
-		}));
+		const sourceSkillNames = new Set(skills.map((skill) => sanitizeName(skill.installName)));
+		const skillChoices = [...skills.map((s) => {
+			const external = externalSkillsByName.get(sanitizeName(s.installName));
+			return {
+				value: s,
+				label: s.installName,
+				hint: s.description.length > 60 ? s.description.slice(0, 57) + "…" : s.description,
+				detail: external ? `Installed outside this source at ${external.path}` : s.description,
+				status: external ? "external" : isEnabled(s.installName, enabledNames) ? "enabled" : void 0,
+				readOnly: Boolean(external)
+			};
+		}), ...externalSkills.filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name))).sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
+			value: skill,
+			label: skill.name,
+			hint: skill.description.length > 60 ? skill.description.slice(0, 57) + "…" : skill.description,
+			detail: `${skill.description || "Installed skill"} (${skill.path})`,
+			status: "external",
+			readOnly: true
+		}))];
 		const selected = await searchMultiselect({
 			message: `Select enabled ${installGlobally ? "global" : "project"} skills`,
 			items: skillChoices,
@@ -4649,7 +4696,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 			cancel("Installation cancelled");
 			process.exit(0);
 		}
-		selectedSkills = selected;
+		selectedSkills = selected.filter((skill) => skills.includes(skill));
 		skillsToDisable = getDeselectedEnabledSkillNames(enabledSkills, selectedSkills, (skill) => skill.installName);
 	}
 	if (selectedSkills.length === 0) {
@@ -5071,8 +5118,11 @@ async function runAdd(args, options = {}) {
 		const lockSource = directDownload ? null : getLockSource(parsed.url, normalizedSource);
 		const currentSource = lockSource || parsed.url;
 		const ownershipSource = getRepositoryOwnershipSource(parsed.url, normalizedSource);
-		const enabledNames = !options.yes && !options.skill?.length ? await enabledNamesForSource(installGlobally, ownershipSource) : /* @__PURE__ */ new Set();
+		const managesEnabledState = !options.yes && !options.skill?.length;
+		const enabledNames = managesEnabledState ? await enabledNamesForSource(installGlobally, ownershipSource) : /* @__PURE__ */ new Set();
 		const enabledSkills = skills.filter((skill) => isEnabled(skill.name, enabledNames));
+		const externalSkills = await externalInstalledSkillsForSource(installGlobally, managesEnabledState, ownershipSource);
+		const externalSkillsByName = new Map(externalSkills.map((skill) => [sanitizeName(skill.name), skill]));
 		let skillsToDisable = [];
 		let selectedSkills;
 		if (options.skill?.includes("*")) {
@@ -5088,7 +5138,7 @@ async function runAdd(args, options = {}) {
 				process.exit(1);
 			}
 			log.info(`Selected ${selectedSkills.length} skill${selectedSkills.length !== 1 ? "s" : ""}: ${selectedSkills.map((s) => import_picocolors.default.cyan(getSkillDisplayName(s))).join(", ")}`);
-		} else if (skills.length === 1 && enabledSkills.length === 0) {
+		} else if (skills.length === 1 && enabledSkills.length === 0 && externalSkills.length === 0) {
 			selectedSkills = skills;
 			const firstSkill = skills[0];
 			log.info(`Skill: ${import_picocolors.default.cyan(getSkillDisplayName(firstSkill))}`);
@@ -5105,13 +5155,24 @@ async function runAdd(args, options = {}) {
 			});
 			const hasGroups = sortedSkills.some((s) => s.pluginName);
 			const kebabToTitle = (s) => s.split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
-			const skillChoices = sortedSkills.map((s) => ({
-				value: s,
-				label: getSkillDisplayName(s),
-				group: hasGroups ? s.pluginName ? kebabToTitle(s.pluginName) : "Other" : void 0,
-				detail: s.description,
-				status: isEnabled(s.name, enabledNames) ? "enabled" : void 0
-			}));
+			const sourceSkillNames = new Set(sortedSkills.map((skill) => sanitizeName(skill.name)));
+			const skillChoices = [...sortedSkills.map((s) => {
+				const external = externalSkillsByName.get(sanitizeName(s.name));
+				return {
+					value: s,
+					label: getSkillDisplayName(s),
+					group: hasGroups ? s.pluginName ? kebabToTitle(s.pluginName) : "Other" : void 0,
+					detail: external ? `Installed outside this source at ${external.path}` : s.description,
+					status: external ? "external" : isEnabled(s.name, enabledNames) ? "enabled" : void 0,
+					readOnly: Boolean(external)
+				};
+			}), ...externalSkills.filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name))).sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
+				value: skill,
+				label: skill.name,
+				detail: `${skill.description || "Installed skill"} (${skill.path})`,
+				status: "external",
+				readOnly: true
+			}))];
 			const selected = await searchMultiselect({
 				message: hasGroups ? `Select enabled ${installGlobally ? "global" : "project"} skills ${import_picocolors.default.dim("(space to toggle)")}` : `Select enabled ${installGlobally ? "global" : "project"} skills`,
 				items: skillChoices,

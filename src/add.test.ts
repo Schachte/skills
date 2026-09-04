@@ -8,6 +8,7 @@ import {
   parseAddOptions,
   getDeselectedEnabledSkillNames,
   getEnabledNamesForSource,
+  getExternalInstalledSkills,
   getWellKnownOwnershipSource,
   getRepositoryOwnershipSource,
   getLockSource,
@@ -776,6 +777,38 @@ describe('getEnabledNamesForSource', () => {
     };
     expect([...getEnabledNamesForSource(entries, 'https://example.com/team-a')]).toEqual(['skill']);
     expect([...getEnabledNamesForSource(entries, 'https://example.com/team-b')]).toEqual([]);
+  });
+});
+
+describe('getExternalInstalledSkills', () => {
+  it('returns installed skills not owned by the selected source', () => {
+    const installed = [{ name: 'current' }, { name: 'other' }, { name: 'untracked' }];
+    const entries = {
+      current: { source: 'owner/current' },
+      other: { source: 'owner/other' },
+    };
+
+    expect(getExternalInstalledSkills(installed, entries, 'owner/current')).toEqual([
+      { name: 'other' },
+      { name: 'untracked' },
+    ]);
+  });
+
+  it('matches ownership using installed sanitized names', () => {
+    const installed = [{ name: 'plugin-review' }];
+    const entries = { 'plugin:review': { source: 'owner/current' } };
+
+    expect(getExternalInstalledSkills(installed, entries, 'owner/current')).toEqual([]);
+  });
+
+  it('treats colliding sanitized names from another source as external', () => {
+    const installed = [{ name: 'plugin-review' }];
+    const entries = {
+      'plugin:review': { source: 'owner/current' },
+      'plugin-review': { source: 'owner/other' },
+    };
+
+    expect(getExternalInstalledSkills(installed, entries, 'owner/current')).toEqual(installed);
   });
 });
 

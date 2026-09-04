@@ -158,4 +158,26 @@ describe('searchMultiselect visual row counting', () => {
     toggleAllItems(selected, items);
     expect(selected).toEqual(new Set());
   });
+
+  it('keeps read-only skills out of individual, group, and Select All changes', () => {
+    const items = [
+      { value: 'managed', label: 'managed', group: 'Skills' },
+      { value: 'external', label: 'external', group: 'Skills', readOnly: true },
+    ];
+    const entries = buildSearchEntries(items, true);
+    const selected = new Set<string>();
+
+    toggleSearchEntry(selected, entries[0]);
+    expect(selected).toEqual(new Set(['managed']));
+    expect(getSelectAllState(selected, items)).toBe('all');
+
+    const externalEntry = entries.find(
+      (entry) => entry.type === 'item' && entry.item.value === 'external'
+    );
+    toggleSearchEntry(selected, externalEntry);
+    expect(selected).toEqual(new Set(['managed']));
+
+    toggleAllItems(selected, items);
+    expect(selected).toEqual(new Set());
+  });
 });

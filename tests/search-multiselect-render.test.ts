@@ -55,6 +55,28 @@ describe('searchMultiselect rendering', () => {
     write.mockRestore();
   });
 
+  it('shows external skills as selected read-only rows without returning them', async () => {
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+    const prompt = searchMultiselect({
+      message: 'Select skills',
+      items: [
+        { value: 'managed', label: 'managed' },
+        { value: 'external', label: 'external', status: 'external', readOnly: true },
+      ],
+      selectAll: true,
+    });
+
+    const initial = stripVTControlCharacters(String(write.mock.calls.at(-1)?.[0]));
+    expect(initial).toContain('Select All (0/1)');
+    expect(initial).toContain('✓ external external');
+
+    process.stdin.emit('keypress', '', { name: 'space' });
+    process.stdin.emit('keypress', '', { name: 'return' });
+    await expect(prompt).resolves.toEqual(['managed']);
+    write.mockRestore();
+  });
+
   it('keeps the full prompt inside a short terminal viewport', async () => {
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     const originalRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');

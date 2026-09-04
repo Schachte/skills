@@ -20,6 +20,8 @@ export interface SearchItem<T> {
   group?: string;
   /** Optional detail rendered in a fixed pane for the highlighted item. */
   detail?: string;
+  /** Display the item as selected without allowing it to be changed or returned. */
+  readOnly?: boolean;
 }
 
 export interface LockedSection<T> {
@@ -238,8 +240,10 @@ export function buildSearchEntries<T>(
 /** Toggle one item, or every item represented by a selectable group heading. */
 export function toggleSearchEntry<T>(selected: Set<T>, entry: SearchEntry<T> | undefined): void {
   if (entry?.type === 'group') {
-    const allSelected = entry.items.every((item) => selected.has(item.value));
-    for (const item of entry.items) {
+    const selectableItems = entry.items.filter((item) => !item.readOnly);
+    if (selectableItems.length === 0) return;
+    const allSelected = selectableItems.every((item) => selected.has(item.value));
+    for (const item of selectableItems) {
       if (allSelected) {
         selected.delete(item.value);
       } else {
@@ -247,6 +251,7 @@ export function toggleSearchEntry<T>(selected: Set<T>, entry: SearchEntry<T> | u
       }
     }
   } else if (entry?.type === 'item') {
+    if (entry.item.readOnly) return;
     if (selected.has(entry.item.value)) {
       selected.delete(entry.item.value);
     } else {
@@ -262,16 +267,17 @@ export function getSelectAllState<T>(
   selected: ReadonlySet<T>,
   items: SearchItem<T>[]
 ): SelectAllState {
-  const selectedCount = items.filter((item) => selected.has(item.value)).length;
+  const selectableItems = items.filter((item) => !item.readOnly);
+  const selectedCount = selectableItems.filter((item) => selected.has(item.value)).length;
   if (selectedCount === 0) return 'none';
-  if (selectedCount === items.length) return 'all';
+  if (selectedCount === selectableItems.length) return 'all';
   return 'partial';
 }
 
 /** Select every item unless they are all selected, in which case clear them all. */
 export function toggleAllItems<T>(selected: Set<T>, items: SearchItem<T>[]): void {
   const shouldClear = getSelectAllState(selected, items) === 'all';
-  for (const item of items) {
+  for (const item of items.filter((candidate) => !candidate.readOnly)) {
     if (shouldClear) {
       selected.delete(item.value);
     } else {
@@ -316,9 +322,10 @@ export async function searchMultiselect<T>(
     }
     readline.emitKeypressEvents(process.stdin, rl);
 
+    const readOnlyValues = new Set(items.filter((item) => item.readOnly).map((item) => item.value));
     let query = '';
     let cursor = 0;
-    const selected = new Set<T>(initialSelected);
+    const selected = new Set<T>(initialSelected.filter((value) => !readOnlyValues.has(value)));
     const collapsedGroups = new Set<string>();
     let lastRenderHeight = 0;
 
@@ -342,7 +349,8 @@ export async function searchMultiselect<T>(
       const lines: string[] = [];
       const filtered = getFiltered();
       const entries = buildSearchEntries(filtered, selectGroups, collapsedGroups);
-      const hasSelectAll = selectAll && items.length > 0;
+      const selectableItems = items.filter((item) => !item.readOnly);
+      const hasSelectAll = selectAll && selectableItems.length > 0;
       const entryCursor = cursor - (hasSelectAll ? 1 : 0);
 
       // Header
@@ -376,7 +384,7 @@ export async function searchMultiselect<T>(
         }
 
         if (hasSelectAll) {
-          const selectedCount = items.filter((item) => selected.has(item.value)).length;
+          const selectedCount = selectableItems.filter((item) => selected.has(item.value)).length;
           const selectAllState = getSelectAllState(selected, items);
           const radio =
             selectAllState === 'all'
@@ -388,7 +396,7 @@ export async function searchMultiselect<T>(
           const prefix = isCursor ? pc.cyan('❯') : ' ';
           const label = isCursor ? pc.underline(pc.bold('Select All')) : pc.bold('Select All');
           lines.push(
-            `${S_BAR} ${prefix} ${radio} ${label} ${pc.dim(`(${selectedCount}/${items.length})`)}`
+            `${S_BAR} ${prefix} ${radio} ${label} ${pc.dim(`(${selectedCount}/${selectableItems.length})`)}`
           );
           lines.push(`${S_BAR}   ${S_BAR_H.repeat(36)}`);
         }
@@ -406,7 +414,7 @@ export async function searchMultiselect<T>(
             const entry = entries[entryCursor];
             const detail =
               hasSelectAll && cursor === 0
-                ? `Select or clear all ${items.length} skills.`
+                ? `Select or clear all ${selectableItems.length} skills.`
                 : entry?.type === 'group'
                   ? `Select all ${entry.items.length} skills in ${entry.group}.`
                   : entry?.item.detail;
@@ -424,6 +432,7 @@ export async function searchMultiselect<T>(
             footerLines.push(`${S_BAR}`);
             const allSelectedLabels = [
               ...(lockedSection ? lockedSection.items.map((i) => i.label) : []),
+              ...items.filter((item) => item.readOnly).map((item) => item.label),
               ...items.filter((item) => selected.has(item.value)).map((item) => item.label),
             ];
             if (allSelectedLabels.length === 0) {
@@ -466,13 +475,16 @@ export async function searchMultiselect<T>(
             const isCursor = actualIndex === entryCursor;
 
             if (entry.type === 'group') {
-              const selectedCount = entry.items.filter((item) => selected.has(item.value)).length;
+              const groupItems = entry.items.filter((item) => !item.readOnly);
+              const selectedCount = groupItems.filter((item) => selected.has(item.value)).length;
               const radio =
-                selectedCount === entry.items.length
-                  ? S_RADIO_ACTIVE
-                  : selectedCount > 0
-                    ? pc.yellow('◐')
-                    : S_RADIO_INACTIVE;
+                groupItems.length === 0
+                  ? S_CHECKBOX_LOCKED
+                  : selectedCount === groupItems.length
+                    ? S_RADIO_ACTIVE
+                    : selectedCount > 0
+                      ? pc.yellow('◐')
+                      : S_RADIO_INACTIVE;
               const label = isCursor ? pc.underline(pc.bold(entry.group)) : pc.bold(entry.group);
               const prefix = isCursor ? pc.cyan('❯') : ' ';
               const disclosure = pc.dim(entry.collapsed ? '▸' : '▾');
@@ -481,8 +493,12 @@ export async function searchMultiselect<T>(
             }
 
             const item = entry.item;
-            const isSelected = selected.has(item.value);
-            const radio = isSelected ? S_RADIO_ACTIVE : S_RADIO_INACTIVE;
+            const isSelected = item.readOnly || selected.has(item.value);
+            const radio = item.readOnly
+              ? S_CHECKBOX_LOCKED
+              : isSelected
+                ? S_RADIO_ACTIVE
+                : S_RADIO_INACTIVE;
             const label = isCursor ? pc.underline(item.label) : item.label;
             const status = item.status ? ` ${pc.green(item.status)}` : '';
             const hint = item.hint ? pc.dim(` (${item.hint})`) : '';
@@ -552,6 +568,7 @@ export async function searchMultiselect<T>(
         // Final state - show what was selected (including locked)
         const allSelectedLabels = [
           ...(lockedSection ? lockedSection.items.map((i) => i.label) : []),
+          ...items.filter((item) => item.readOnly).map((item) => item.label),
           ...items.filter((item) => selected.has(item.value)).map((item) => item.label),
         ];
         lines.push(`${S_BAR}  ${pc.dim(allSelectedLabels.join(', '))}`);
@@ -585,7 +602,10 @@ export async function searchMultiselect<T>(
       render('submit');
       cleanup();
       // Include locked values in the result
-      resolve([...lockedValues, ...Array.from(selected)]);
+      resolve([
+        ...lockedValues,
+        ...Array.from(selected).filter((value) => !readOnlyValues.has(value)),
+      ]);
     };
 
     const cancel = (): void => {
@@ -599,7 +619,7 @@ export async function searchMultiselect<T>(
       if (!key) return;
 
       const entries = buildSearchEntries(getFiltered(), selectGroups, collapsedGroups);
-      const hasSelectAll = selectAll && items.length > 0;
+      const hasSelectAll = selectAll && items.some((item) => !item.readOnly);
       const cursorOffset = hasSelectAll ? 1 : 0;
       const entry = entries[cursor - cursorOffset];
 
