@@ -10,6 +10,7 @@ import {
   getEnabledNamesForSource,
   getExternalInstalledSkills,
   getExternalSkillStateChanges,
+  getProjectSkillChoices,
   getWellKnownOwnershipSource,
   getRepositoryOwnershipSource,
   getLockSource,
@@ -855,6 +856,28 @@ describe('getExternalSkillStateChanges', () => {
       enable: ['enabled'],
       disable: [],
     });
+  });
+});
+
+describe('getProjectSkillChoices', () => {
+  it('labels cwd project skills and keeps them read-only', () => {
+    const skill = {
+      name: 'local-skill',
+      description: 'Local skill',
+      path: '/project/.agents/skills/local-skill',
+      canonicalPath: '/project/.agents/skills/local-skill',
+      scope: 'project' as const,
+      agents: [],
+    };
+
+    expect(getProjectSkillChoices([skill])).toMatchObject([
+      {
+        value: skill,
+        label: 'local-skill',
+        status: 'project',
+        readOnly: true,
+      },
+    ]);
   });
 });
 

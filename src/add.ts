@@ -13,9 +13,11 @@ import {
   installBlobSkillForAgent,
   isSkillInstalled,
   getCanonicalPath,
+  listInstalledSkills,
   installWellKnownSkillForAgent,
   sanitizeName,
   type InstallMode,
+  type InstalledSkill,
 } from './installer.ts';
 import { removeCommand } from './remove.ts';
 import {
@@ -649,6 +651,27 @@ async function externalInstalledSkillsForSource(
   return getExternalInstalledSkills(installedSkills, lock.skills, source);
 }
 
+async function projectInstalledSkillsForCwd(
+  managesEnabledState: boolean
+): Promise<InstalledSkill[]> {
+  if (!managesEnabledState) return [];
+  return listInstalledSkills({ global: false });
+}
+
+export function getProjectSkillChoices(projectSkills: InstalledSkill[]) {
+  return [...projectSkills]
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((skill) => ({
+      value: skill,
+      label: skill.name,
+      hint:
+        skill.description.length > 60 ? skill.description.slice(0, 57) + '…' : skill.description,
+      detail: `${skill.description || 'Installed skill'} (${skill.path})`,
+      status: 'project',
+      readOnly: true,
+    }));
+}
+
 export function getExternalSkillStateChanges(
   externalSkills: GlobalSkillState[],
   selectedValues: unknown[]
@@ -819,6 +842,7 @@ async function handleWellKnownSkills(
     managesEnabledState,
     ownershipSource
   );
+  const projectSkills = await projectInstalledSkillsForCwd(managesEnabledState);
   const externalSkillsByName = new Map(
     externalSkills.map((skill) => [sanitizeName(skill.name), skill])
   );
@@ -887,9 +911,10 @@ async function handleWellKnownSkills(
           detail: `${skill.description || 'Installed skill'} (${skill.path})`,
           status: 'external',
         })),
+      ...getProjectSkillChoices(projectSkills),
     ];
 
-    const selected = await searchMultiselect<WellKnownSkill | GlobalSkillState>({
+    const selected = await searchMultiselect<WellKnownSkill | GlobalSkillState | InstalledSkill>({
       message: `Select enabled ${installGlobally ? 'global' : 'project'} skills`,
       items: skillChoices,
       initialSelected: isSkillsShPackUrl(url)
@@ -917,7 +942,7 @@ async function handleWellKnownSkills(
       process.exit(0);
     }
 
-    const selectedValues = selected as Array<WellKnownSkill | GlobalSkillState>;
+    const selectedValues = selected as Array<WellKnownSkill | GlobalSkillState | InstalledSkill>;
     selectedSkills = selectedValues.filter((skill): skill is WellKnownSkill =>
       skills.includes(skill as WellKnownSkill)
     );
@@ -1621,6 +1646,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       managesEnabledState,
       ownershipSource
     );
+    const projectSkills = await projectInstalledSkillsForCwd(managesEnabledState);
     const externalSkillsByName = new Map(
       externalSkills.map((skill) => [sanitizeName(skill.name), skill])
     );
@@ -1698,9 +1724,10 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             detail: `${skill.description || 'Installed skill'} (${skill.path})`,
             status: 'external',
           })),
+        ...getProjectSkillChoices(projectSkills),
       ];
 
-      const selected = await searchMultiselect<Skill | GlobalSkillState>({
+      const selected = await searchMultiselect<Skill | GlobalSkillState | InstalledSkill>({
         message: hasGroups
           ? `Select enabled ${installGlobally ? 'global' : 'project'} skills ${pc.dim('(space to toggle)')}`
           : `Select enabled ${installGlobally ? 'global' : 'project'} skills`,
@@ -1724,7 +1751,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         process.exit(0);
       }
 
-      const selectedValues = selected as Array<Skill | GlobalSkillState>;
+      const selectedValues = selected as Array<Skill | GlobalSkillState | InstalledSkill>;
       selectedSkills = selectedValues.filter((skill): skill is Skill =>
         skills.includes(skill as Skill)
       );

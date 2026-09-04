@@ -4633,6 +4633,20 @@ async function externalInstalledSkillsForSource(global, managesEnabledState, sou
 	const [installedSkills, lock] = await Promise.all([listGlobalSkillStates(), readSkillLock()]);
 	return getExternalInstalledSkills(installedSkills, lock.skills, source);
 }
+async function projectInstalledSkillsForCwd(managesEnabledState) {
+	if (!managesEnabledState) return [];
+	return listInstalledSkills({ global: false });
+}
+function getProjectSkillChoices(projectSkills) {
+	return [...projectSkills].sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
+		value: skill,
+		label: skill.name,
+		hint: skill.description.length > 60 ? skill.description.slice(0, 57) + "…" : skill.description,
+		detail: `${skill.description || "Installed skill"} (${skill.path})`,
+		status: "project",
+		readOnly: true
+	}));
+}
 function getExternalSkillStateChanges(externalSkills, selectedValues) {
 	const selected = new Set(selectedValues);
 	return {
@@ -4739,6 +4753,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 	const enabledNames = managesEnabledState ? await enabledNamesForSource(installGlobally, ownershipSource) : /* @__PURE__ */ new Set();
 	const enabledSkills = skills.filter((skill) => isEnabled(skill.installName, enabledNames));
 	const externalSkills = await externalInstalledSkillsForSource(installGlobally, managesEnabledState, ownershipSource);
+	const projectSkills = await projectInstalledSkillsForCwd(managesEnabledState);
 	const externalSkillsByName = new Map(externalSkills.map((skill) => [sanitizeName(skill.name), skill]));
 	let skillsToDisable = [];
 	let externalChanges = {
@@ -4766,22 +4781,26 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 		log.info(`Installing all ${skills.length} skills`);
 	} else {
 		const sourceSkillNames = new Set(skills.map((skill) => sanitizeName(skill.installName)));
-		const skillChoices = [...skills.map((s) => {
-			const external = externalSkillsByName.get(sanitizeName(s.installName));
-			return {
-				value: external ?? s,
-				label: s.installName,
-				hint: s.description.length > 60 ? s.description.slice(0, 57) + "…" : s.description,
-				detail: external ? `Installed outside this source at ${external.path}` : s.description,
-				status: external ? "external" : isEnabled(s.installName, enabledNames) ? "enabled" : void 0
-			};
-		}), ...externalSkills.filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name))).sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
-			value: skill,
-			label: skill.name,
-			hint: skill.description.length > 60 ? skill.description.slice(0, 57) + "…" : skill.description,
-			detail: `${skill.description || "Installed skill"} (${skill.path})`,
-			status: "external"
-		}))];
+		const skillChoices = [
+			...skills.map((s) => {
+				const external = externalSkillsByName.get(sanitizeName(s.installName));
+				return {
+					value: external ?? s,
+					label: s.installName,
+					hint: s.description.length > 60 ? s.description.slice(0, 57) + "…" : s.description,
+					detail: external ? `Installed outside this source at ${external.path}` : s.description,
+					status: external ? "external" : isEnabled(s.installName, enabledNames) ? "enabled" : void 0
+				};
+			}),
+			...externalSkills.filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name))).sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
+				value: skill,
+				label: skill.name,
+				hint: skill.description.length > 60 ? skill.description.slice(0, 57) + "…" : skill.description,
+				detail: `${skill.description || "Installed skill"} (${skill.path})`,
+				status: "external"
+			})),
+			...getProjectSkillChoices(projectSkills)
+		];
 		const selected = await searchMultiselect({
 			message: `Select enabled ${installGlobally ? "global" : "project"} skills`,
 			items: skillChoices,
@@ -5240,6 +5259,7 @@ async function runAdd(args, options = {}) {
 		const enabledNames = managesEnabledState ? await enabledNamesForSource(installGlobally, ownershipSource) : /* @__PURE__ */ new Set();
 		const enabledSkills = skills.filter((skill) => isEnabled(skill.name, enabledNames));
 		const externalSkills = await externalInstalledSkillsForSource(installGlobally, managesEnabledState, ownershipSource);
+		const projectSkills = await projectInstalledSkillsForCwd(managesEnabledState);
 		const externalSkillsByName = new Map(externalSkills.map((skill) => [sanitizeName(skill.name), skill]));
 		let skillsToDisable = [];
 		let externalChanges = {
@@ -5278,21 +5298,25 @@ async function runAdd(args, options = {}) {
 			const hasGroups = sortedSkills.some((s) => s.pluginName);
 			const kebabToTitle = (s) => s.split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 			const sourceSkillNames = new Set(sortedSkills.map((skill) => sanitizeName(skill.name)));
-			const skillChoices = [...sortedSkills.map((s) => {
-				const external = externalSkillsByName.get(sanitizeName(s.name));
-				return {
-					value: external ?? s,
-					label: getSkillDisplayName(s),
-					group: hasGroups ? s.pluginName ? kebabToTitle(s.pluginName) : "Other" : void 0,
-					detail: external ? `Installed outside this source at ${external.path}` : s.description,
-					status: external ? "external" : isEnabled(s.name, enabledNames) ? "enabled" : void 0
-				};
-			}), ...externalSkills.filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name))).sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
-				value: skill,
-				label: skill.name,
-				detail: `${skill.description || "Installed skill"} (${skill.path})`,
-				status: "external"
-			}))];
+			const skillChoices = [
+				...sortedSkills.map((s) => {
+					const external = externalSkillsByName.get(sanitizeName(s.name));
+					return {
+						value: external ?? s,
+						label: getSkillDisplayName(s),
+						group: hasGroups ? s.pluginName ? kebabToTitle(s.pluginName) : "Other" : void 0,
+						detail: external ? `Installed outside this source at ${external.path}` : s.description,
+						status: external ? "external" : isEnabled(s.name, enabledNames) ? "enabled" : void 0
+					};
+				}),
+				...externalSkills.filter((skill) => !sourceSkillNames.has(sanitizeName(skill.name))).sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
+					value: skill,
+					label: skill.name,
+					detail: `${skill.description || "Installed skill"} (${skill.path})`,
+					status: "external"
+				})),
+				...getProjectSkillChoices(projectSkills)
+			];
 			const selected = await searchMultiselect({
 				message: hasGroups ? `Select enabled ${installGlobally ? "global" : "project"} skills ${import_picocolors.default.dim("(space to toggle)")}` : `Select enabled ${installGlobally ? "global" : "project"} skills`,
 				items: skillChoices,
