@@ -14,8 +14,10 @@ import {
   isSkillInstalled,
   getCanonicalPath,
   installWellKnownSkillForAgent,
+  sanitizeName,
   type InstallMode,
 } from './installer.ts';
+import { removeCommand } from './remove.ts';
 import {
   detectInstalledAgents,
   agents,
@@ -47,8 +49,9 @@ import {
   dismissPrompt,
   getLastSelectedAgents,
   saveSelectedAgents,
+  readSkillLock,
 } from './skill-lock.ts';
-import { addSkillToLocalLock, computeSkillFolderHash } from './local-lock.ts';
+import { addSkillToLocalLock, computeSkillFolderHash, readLocalLock } from './local-lock.ts';
 import type { Skill, AgentType } from './types.ts';
 import {
   tryBlobInstall,
@@ -538,6 +541,131 @@ export interface AddOptions {
   subagent?: string[];
 }
 
+async function resolveInstallScope(options: AddOptions): Promise<boolean> {
+  if (options.global) return true;
+  if (options.yes) return false;
+
+  const scope = await p.select({
+    message: 'Installation scope',
+    options: [
+      {
+        value: false,
+        label: 'Project',
+        hint: 'Install in current directory (committed with your project)',
+      },
+      {
+        value: true,
+        label: 'Global',
+        hint: 'Install in home directory (available across all projects)',
+      },
+    ],
+  });
+
+  if (p.isCancel(scope)) {
+    p.cancel('Installation cancelled');
+    process.exit(0);
+  }
+
+  return scope as boolean;
+}
+
+async function enabledNamesForSource(global: boolean, source: string): Promise<Set<string>> {
+  const lock = global ? await readSkillLock() : await readLocalLock();
+  return getEnabledNamesForSource(lock.skills, source);
+}
+
+export function getEnabledNamesForSource(
+  entries: Record<
+    string,
+    {
+      source: string;
+      ownershipSource?: string;
+      sourceType?: string;
+      sourceUrl?: string;
+      sourceBaseUrl?: string;
+    }
+  >,
+  source: string
+): Set<string> {
+  return new Set(
+    Object.entries(entries)
+      .filter(([, entry]) => {
+        let identity = entry.ownershipSource;
+        if (!identity && entry.sourceType === 'well-known') {
+          const legacyUrl = entry.sourceBaseUrl ?? entry.sourceUrl;
+          if (legacyUrl) identity = getWellKnownOwnershipSource(legacyUrl);
+        }
+        if (!identity && entry.sourceType === 'github') {
+          identity = `github:${entry.source.toLowerCase()}`;
+        }
+        if (!identity && isGitHubSshSource(entry.source)) {
+          const normalized = getOwnerRepo(parseSource(entry.source));
+          if (normalized) identity = `github:${normalized.toLowerCase()}`;
+        }
+        return (identity ?? entry.source) === source;
+      })
+      .map(([name]) => sanitizeName(name))
+  );
+}
+
+function isGitHubSshSource(source: string): boolean {
+  if (/^git@github\.com:/i.test(source)) return true;
+  if (!source.startsWith('ssh://')) return false;
+  try {
+    const hostname = new URL(source).hostname.toLowerCase();
+    return hostname === 'github.com' || hostname === 'ssh.github.com';
+  } catch {
+    return false;
+  }
+}
+
+export function getWellKnownOwnershipSource(url: string): string {
+  const parsed = new URL(url);
+  parsed.hash = '';
+  if (parsed.pathname !== '/') parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+  return parsed.toString();
+}
+
+export function getRepositoryOwnershipSource(
+  parsedUrl: string,
+  normalizedSource: string | null
+): string {
+  const isGitHubDotCom =
+    /^git@github\.com:/i.test(parsedUrl) ||
+    isGitHubSshSource(parsedUrl) ||
+    (() => {
+      try {
+        return new URL(parsedUrl).hostname.toLowerCase() === 'github.com';
+      } catch {
+        return false;
+      }
+    })();
+  if (isGitHubDotCom && normalizedSource) {
+    return `github:${normalizedSource.toLowerCase()}`;
+  }
+  return getLockSource(parsedUrl, normalizedSource) ?? parsedUrl;
+}
+
+function isEnabled(name: string, enabledNames: Set<string>): boolean {
+  return enabledNames.has(sanitizeName(name));
+}
+
+export function getDeselectedEnabledSkillNames<T>(
+  enabledSkills: T[],
+  selectedSkills: T[],
+  getName: (skill: T) => string
+): string[] {
+  const selectedNames = new Set(selectedSkills.map((skill) => sanitizeName(getName(skill))));
+  return enabledSkills
+    .filter((skill) => !selectedNames.has(sanitizeName(getName(skill))))
+    .map(getName);
+}
+
+async function applySkillRemovals(skillNames: string[], global: boolean): Promise<void> {
+  if (skillNames.length === 0) return;
+  await removeCommand(skillNames, { global, yes: true, embedded: true });
+}
+
 /**
  * Handle skills from a well-known endpoint (RFC 8615).
  * Discovers skills from /.well-known/agent-skills/index.json (preferred)
@@ -608,6 +736,17 @@ async function handleWellKnownSkills(
     process.exit(0);
   }
 
+  const installGlobally = await resolveInstallScope(options);
+  options.global = installGlobally;
+  const sourceIdentifier = wellKnownProvider.getSourceIdentifier(url);
+  const ownershipSource = getWellKnownOwnershipSource(url);
+  const managesEnabledState = !options.yes && !options.skill?.length;
+  const enabledNames = managesEnabledState
+    ? await enabledNamesForSource(installGlobally, ownershipSource)
+    : new Set<string>();
+  const enabledSkills = skills.filter((skill) => isEnabled(skill.installName, enabledNames));
+  let skillsToDisable: string[] = [];
+
   // Filter skills if --skill option is provided
   let selectedSkills: WellKnownSkill[];
 
@@ -632,7 +771,7 @@ async function handleWellKnownSkills(
       }
       process.exit(1);
     }
-  } else if (skills.length === 1) {
+  } else if (skills.length === 1 && enabledSkills.length === 0) {
     selectedSkills = skills;
     const firstSkill = skills[0]!;
     p.log.info(`Skill: ${pc.cyan(firstSkill.installName)}`);
@@ -645,13 +784,16 @@ async function handleWellKnownSkills(
       value: s,
       label: s.installName,
       hint: s.description.length > 60 ? s.description.slice(0, 57) + '…' : s.description,
+      status: isEnabled(s.installName, enabledNames) ? 'enabled' : undefined,
     }));
 
     const selected = await searchMultiselect({
-      message: 'Select skills to install',
+      message: `Select enabled ${installGlobally ? 'global' : 'project'} skills`,
       items: skillChoices,
-      initialSelected: isSkillsShPackUrl(url) ? skills : undefined,
-      required: true,
+      initialSelected: isSkillsShPackUrl(url)
+        ? Array.from(new Set([...skills, ...enabledSkills]))
+        : enabledSkills,
+      required: false,
       maxVisible: 20,
       selectAll: true,
     });
@@ -662,6 +804,28 @@ async function handleWellKnownSkills(
     }
 
     selectedSkills = selected as WellKnownSkill[];
+    skillsToDisable = getDeselectedEnabledSkillNames(
+      enabledSkills,
+      selectedSkills,
+      (skill) => skill.installName
+    );
+  }
+
+  if (selectedSkills.length === 0) {
+    if (skillsToDisable.length === 0) {
+      p.outro(pc.dim('No changes.'));
+      return true;
+    }
+
+    p.note(skillsToDisable.map((name) => pc.red(`Disable ${name}`)).join('\n'), 'Changes Summary');
+    const confirmed = await p.confirm({ message: 'Apply changes?' });
+    if (p.isCancel(confirmed) || !confirmed) {
+      p.cancel('Changes cancelled');
+      process.exit(0);
+    }
+    await applySkillRemovals(skillsToDisable, installGlobally);
+    p.outro(pc.green('Done!'));
+    return true;
   }
 
   // Detect agents
@@ -736,34 +900,20 @@ async function handleWellKnownSkills(
     }
   }
 
-  let installGlobally = options.global ?? false;
-
-  // Check if any selected agents support global installation
-  const supportsGlobal = targetAgents.some((a) => agents[a].globalSkillsDir !== undefined);
-
-  if (options.global === undefined && !options.yes && supportsGlobal) {
-    const scope = await p.select({
-      message: 'Installation scope',
-      options: [
-        {
-          value: false,
-          label: 'Project',
-          hint: 'Install in current directory (committed with your project)',
-        },
-        {
-          value: true,
-          label: 'Global',
-          hint: 'Install in home directory (available across all projects)',
-        },
-      ],
-    });
-
-    if (p.isCancel(scope)) {
-      p.cancel('Installation cancelled');
-      process.exit(0);
+  if (installGlobally) {
+    const unsupportedAgents = targetAgents.filter(
+      (agent) => agents[agent].globalSkillsDir === undefined
+    );
+    if (unsupportedAgents.length > 0) {
+      p.log.warn(
+        `Skipping agents without global skill support: ${unsupportedAgents.map((agent) => agents[agent].displayName).join(', ')}`
+      );
+      targetAgents = targetAgents.filter((agent) => agents[agent].globalSkillsDir !== undefined);
     }
-
-    installGlobally = scope as boolean;
+    if (targetAgents.length === 0) {
+      p.log.error('None of the selected agents support global skill installation.');
+      process.exit(1);
+    }
   }
 
   // Determine install mode (symlink vs copy)
@@ -842,11 +992,22 @@ async function handleWellKnownSkills(
     }
   }
 
+  if (skillsToDisable.length > 0) {
+    if (summaryLines.length > 0) summaryLines.push('');
+    summaryLines.push(pc.bold('Disable'));
+    for (const name of skillsToDisable) summaryLines.push(`  ${pc.red(name)}`);
+  }
+
   console.log();
-  p.note(summaryLines.join('\n'), 'Installation Summary');
+  p.note(
+    summaryLines.join('\n'),
+    skillsToDisable.length > 0 ? 'Changes Summary' : 'Installation Summary'
+  );
 
   if (!options.yes) {
-    const confirmed = await p.confirm({ message: 'Proceed with installation?' });
+    const confirmed = await p.confirm({
+      message: skillsToDisable.length > 0 ? 'Apply changes?' : 'Proceed with installation?',
+    });
 
     if (p.isCancel(confirmed) || !confirmed) {
       p.cancel('Installation cancelled');
@@ -855,7 +1016,6 @@ async function handleWellKnownSkills(
   }
 
   // Kick off privacy check early so it runs in parallel with installation
-  const sourceIdentifier = wellKnownProvider.getSourceIdentifier(url);
   const wellKnownPrivacyPromise = isSourcePrivate(sourceIdentifier).catch(() => null);
 
   spinner.start('Installing skills…');
@@ -891,6 +1051,12 @@ async function handleWellKnownSkills(
   const successful = results.filter((r) => r.success);
   const failed = results.filter((r) => !r.success);
 
+  if (failed.length === 0) {
+    await applySkillRemovals(skillsToDisable, installGlobally);
+  } else if (skillsToDisable.length > 0) {
+    p.log.warn('Skipped disabling skills because installation did not complete successfully.');
+  }
+
   // Build skillFiles map: { skillName: sourceUrl }
   const skillFiles: Record<string, string> = {};
   for (const skill of selectedSkills) {
@@ -921,6 +1087,7 @@ async function handleWellKnownSkills(
         try {
           await addSkillToLock(skill.installName, {
             source: sourceIdentifier,
+            ownershipSource,
             sourceType: 'well-known',
             sourceUrl: skill.sourceUrl,
             skillFolderHash: '',
@@ -948,6 +1115,7 @@ async function handleWellKnownSkills(
               skill.installName,
               {
                 source: sourceIdentifier,
+                ownershipSource,
                 sourceUrl: url,
                 sourceType: 'well-known',
                 computedHash,
@@ -1293,6 +1461,19 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       process.exit(0);
     }
 
+    const installGlobally = await resolveInstallScope(options);
+    options.global = installGlobally;
+    const normalizedSource = directDownload ? null : getOwnerRepo(parsed);
+    const lockSource = directDownload ? null : getLockSource(parsed.url, normalizedSource);
+    const currentSource = lockSource || parsed.url;
+    const ownershipSource = getRepositoryOwnershipSource(parsed.url, normalizedSource);
+    const managesEnabledState = !options.yes && !options.skill?.length;
+    const enabledNames = managesEnabledState
+      ? await enabledNamesForSource(installGlobally, ownershipSource)
+      : new Set<string>();
+    const enabledSkills = skills.filter((skill) => isEnabled(skill.name, enabledNames));
+    let skillsToDisable: string[] = [];
+
     let selectedSkills: Skill[];
 
     if (options.skill?.includes('*')) {
@@ -1315,7 +1496,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       p.log.info(
         `Selected ${selectedSkills.length} skill${selectedSkills.length !== 1 ? 's' : ''}: ${selectedSkills.map((s) => pc.cyan(getSkillDisplayName(s))).join(', ')}`
       );
-    } else if (skills.length === 1) {
+    } else if (skills.length === 1 && enabledSkills.length === 0) {
       selectedSkills = skills;
       const firstSkill = skills[0]!;
       p.log.info(`Skill: ${pc.cyan(getSkillDisplayName(firstSkill))}`);
@@ -1348,14 +1529,16 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         label: getSkillDisplayName(s),
         group: hasGroups ? (s.pluginName ? kebabToTitle(s.pluginName) : 'Other') : undefined,
         detail: s.description,
+        status: isEnabled(s.name, enabledNames) ? 'enabled' : undefined,
       }));
 
       const selected = await searchMultiselect({
         message: hasGroups
-          ? `Select skills to install ${pc.dim('(space to toggle)')}`
-          : 'Select skills to install',
+          ? `Select enabled ${installGlobally ? 'global' : 'project'} skills ${pc.dim('(space to toggle)')}`
+          : `Select enabled ${installGlobally ? 'global' : 'project'} skills`,
         items: skillChoices,
-        required: true,
+        initialSelected: enabledSkills,
+        required: false,
         maxVisible: 20,
         searchable: !hasGroups,
         showDetail: true,
@@ -1371,6 +1554,34 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
 
       selectedSkills = selected as Skill[];
+      skillsToDisable = getDeselectedEnabledSkillNames(
+        enabledSkills,
+        selectedSkills,
+        (skill) => skill.name
+      );
+    }
+
+    if (selectedSkills.length === 0) {
+      if (skillsToDisable.length === 0) {
+        p.outro(pc.dim('No changes.'));
+        await cleanup(tempDir);
+        return;
+      }
+
+      p.note(
+        skillsToDisable.map((name) => pc.red(`Disable ${name}`)).join('\n'),
+        'Changes Summary'
+      );
+      const confirmed = await p.confirm({ message: 'Apply changes?' });
+      if (p.isCancel(confirmed) || !confirmed) {
+        p.cancel('Changes cancelled');
+        await cleanup(tempDir);
+        process.exit(0);
+      }
+      await applySkillRemovals(skillsToDisable, installGlobally);
+      p.outro(pc.green('Done!'));
+      await cleanup(tempDir);
+      return;
     }
 
     // Kick off the security audit only after GitHub has positively confirmed
@@ -1497,6 +1708,23 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       targetAgents = [...targetAgents, 'eve'];
     }
 
+    if (installGlobally) {
+      const unsupportedAgents = targetAgents.filter(
+        (agent) => agents[agent].globalSkillsDir === undefined
+      );
+      if (unsupportedAgents.length > 0) {
+        p.log.warn(
+          `Skipping agents without global skill support: ${unsupportedAgents.map((agent) => agents[agent].displayName).join(', ')}`
+        );
+        targetAgents = targetAgents.filter((agent) => agents[agent].globalSkillsDir !== undefined);
+      }
+      if (targetAgents.length === 0) {
+        p.log.error('None of the selected agents support global skill installation.');
+        await cleanup(tempDir);
+        process.exit(1);
+      }
+    }
+
     // Eve supports subagents, each with their own skills directory at
     // agent/subagents/<name>/skills in addition to the root agent/skills.
     // When Eve is a target, choose which of those to install into.
@@ -1537,37 +1765,6 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     }
 
     const installTargets = buildInstallTargets(targetAgents, eveSubagentTargets);
-
-    let installGlobally = options.global ?? false;
-
-    // Check if any selected agents support global installation
-    const supportsGlobal = targetAgents.some((a) => agents[a].globalSkillsDir !== undefined);
-
-    if (options.global === undefined && !options.yes && supportsGlobal) {
-      const scope = await p.select({
-        message: 'Installation scope',
-        options: [
-          {
-            value: false,
-            label: 'Project',
-            hint: 'Install in current directory (committed with your project)',
-          },
-          {
-            value: true,
-            label: 'Global',
-            hint: 'Install in home directory (available across all projects)',
-          },
-        ],
-      });
-
-      if (p.isCancel(scope)) {
-        p.cancel('Installation cancelled');
-        await cleanup(tempDir);
-        process.exit(0);
-      }
-
-      installGlobally = scope as boolean;
-    }
 
     // Determine install mode (symlink vs copy)
     let installMode: InstallMode = options.copy ? 'copy' : 'symlink';
@@ -1699,8 +1896,17 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       printSkillSummary(ungroupedSummary);
     }
 
+    if (skillsToDisable.length > 0) {
+      if (summaryLines.length > 0) summaryLines.push('');
+      summaryLines.push(pc.bold('Disable'));
+      for (const name of skillsToDisable) summaryLines.push(`  ${pc.red(name)}`);
+    }
+
     console.log();
-    p.note(summaryLines.join('\n'), 'Installation Summary');
+    p.note(
+      summaryLines.join('\n'),
+      skillsToDisable.length > 0 ? 'Changes Summary' : 'Installation Summary'
+    );
 
     // Await and display security audit results (started earlier in parallel)
     // Wrapped in try/catch so a failed audit fetch never blocks installation.
@@ -1724,7 +1930,9 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     }
 
     if (!options.yes) {
-      const confirmed = await p.confirm({ message: 'Proceed with installation?' });
+      const confirmed = await p.confirm({
+        message: skillsToDisable.length > 0 ? 'Apply changes?' : 'Proceed with installation?',
+      });
 
       if (p.isCancel(confirmed) || !confirmed) {
         p.cancel('Installation cancelled');
@@ -1785,6 +1993,12 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     console.log();
     const successful = results.filter((r) => r.success);
     const failed = results.filter((r) => !r.success);
+
+    if (failed.length === 0) {
+      await applySkillRemovals(skillsToDisable, installGlobally);
+    } else if (skillsToDisable.length > 0) {
+      p.log.warn('Skipped disabling skills because installation did not complete successfully.');
+    }
     // Track installation result
     // Build skillFiles map: { skillName: relative path to SKILL.md from repo root }
     const skillFiles: Record<string, string> = {};
@@ -1810,9 +2024,6 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     }
 
     // Normalize source to owner/repo format for telemetry
-    const normalizedSource = directDownload ? null : getOwnerRepo(parsed);
-
-    const lockSource = directDownload ? null : getLockSource(parsed.url, normalizedSource);
     const projectLockSourceUrl = directDownload
       ? undefined
       : getProjectLockSourceUrl(parsed.type, parsed.url);
@@ -1852,13 +2063,13 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     }
 
     // Add to skill lock file for update tracking (only for global installs)
-    if (successful.length > 0 && installGlobally && normalizedSource) {
+    if (successful.length > 0 && installGlobally && !directDownload) {
       const successfulSkillNames = new Set(successful.map((r) => r.skill));
 
       // For GitHub clone installs, fetch the repo tree once and reuse it
       // for all skills — avoids N sequential API calls that take ~400ms each.
       let cachedTree: Awaited<ReturnType<typeof fetchRepoTree>> | undefined;
-      if (parsed.type === 'github' && !blobResult) {
+      if (parsed.type === 'github' && normalizedSource && !blobResult) {
         cachedTree = await fetchRepoTree(normalizedSource, parsed.ref, getGitHubToken);
       }
 
@@ -1882,7 +2093,8 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             }
 
             await addSkillToLock(skill.name, {
-              source: lockSource || normalizedSource,
+              source: currentSource,
+              ...(ownershipSource !== currentSource && { ownershipSource }),
               sourceType: parsed.type,
               sourceUrl: parsed.url,
               ref: parsed.ref,
@@ -1922,6 +2134,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
               skill.name,
               {
                 source: lockSource || parsed.url,
+                ...(ownershipSource !== currentSource && { ownershipSource }),
                 ...(projectLockSourceUrl && { sourceUrl: projectLockSourceUrl }),
                 ref: parsed.ref,
                 sourceType: parsed.type,

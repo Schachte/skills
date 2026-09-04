@@ -14,6 +14,8 @@ export interface SearchItem<T> {
   value: T;
   label: string;
   hint?: string;
+  /** Short state badge rendered after the label. */
+  status?: string;
   /** Optional group heading shown before this item. */
   group?: string;
   /** Optional detail rendered in a fixed pane for the highlighted item. */
@@ -482,6 +484,7 @@ export async function searchMultiselect<T>(
             const isSelected = selected.has(item.value);
             const radio = isSelected ? S_RADIO_ACTIVE : S_RADIO_INACTIVE;
             const label = isCursor ? pc.underline(item.label) : item.label;
+            const status = item.status ? ` ${pc.green(item.status)}` : '';
             const hint = item.hint ? pc.dim(` (${item.hint})`) : '';
 
             const prefix = isCursor ? pc.cyan('❯') : ' ';
@@ -489,7 +492,7 @@ export async function searchMultiselect<T>(
               selectGroups && item.group ? filtered.filter((i) => i.group === item.group) : [];
             const isLastInGroup = groupItems.at(-1) === item;
             const tree = groupItems.length > 0 ? `${pc.dim(isLastInGroup ? '└─' : '├─')} ` : '';
-            itemLines.push(`${S_BAR} ${prefix} ${tree}${radio} ${label}${hint}`);
+            itemLines.push(`${S_BAR} ${prefix} ${tree}${radio} ${label}${status}${hint}`);
           }
 
           const hiddenBefore = visibleStart;

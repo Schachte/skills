@@ -81,6 +81,8 @@ For GitHub tree lookups, `skills` first tries the API anonymously, then an expli
 | `-y, --yes`               | Skip all confirmation prompts                                                                                                                      |
 | `--all`                   | Install all skills to all agents without prompts                                                                                                   |
 
+Interactive installs ask for the scope before showing skills. Skills already enabled in that scope are marked and preselected. The submitted selection becomes the enabled set for that source: selecting adds skills and deselecting removes them from all agent directories in the chosen scope. Commands using `--skill`, `--all`, or `--yes` remain additive and never remove skills.
+
 ### Examples
 
 ```bash

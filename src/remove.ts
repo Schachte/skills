@@ -21,6 +21,8 @@ export interface RemoveOptions {
   agent?: string[];
   yes?: boolean;
   all?: boolean;
+  /** Suppress standalone command chrome when called from another workflow. */
+  embedded?: boolean;
 }
 
 /**
@@ -60,14 +62,16 @@ export function resolveSkillsToRemove(
 
 export async function removeCommand(skillNames: string[], options: RemoveOptions) {
   // Auto-enable non-interactive mode when running inside an AI agent
-  const agentResult = await detectAgent();
-  if (agentResult.isAgent) {
-    options.yes = true;
-    p.log.info(
-      pc.bgCyan(pc.black(pc.bold(` ${agentResult.agent.name} `))) +
-        ' ' +
-        'Agent detected — removing non-interactively'
-    );
+  if (!options.embedded) {
+    const agentResult = await detectAgent();
+    if (agentResult.isAgent) {
+      options.yes = true;
+      p.log.info(
+        pc.bgCyan(pc.black(pc.bold(` ${agentResult.agent.name} `))) +
+          ' ' +
+          'Agent detected — removing non-interactively'
+      );
+    }
   }
 
   // `--skill '*'` is the documented synonym for selecting every skill.
@@ -92,9 +96,9 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
   const isGlobal = options.global ?? false;
   const cwd = process.cwd();
 
-  const spinner = p.spinner();
+  const spinner = options.embedded ? null : p.spinner();
 
-  spinner.start('Scanning for installed skills…');
+  spinner?.start('Scanning for installed skills…');
   const skillNamesSet = new Set<string>();
 
   const scanDir = async (dir: string) => {
@@ -131,7 +135,7 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
   }
 
   const installedSkills = Array.from(skillNamesSet).sort();
-  spinner.stop(`Found ${installedSkills.length} unique installed skill(s)`);
+  spinner?.stop(`Found ${installedSkills.length} unique installed skill(s)`);
 
   // Read lock file keys up front. These are needed both to decide whether there is
   // anything to remove (a skill may be missing from disk but still leave a stale lock
@@ -147,7 +151,10 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
       : [];
 
   if (installedSkills.length === 0 && resolvedRequestedSkills.length === 0) {
-    p.outro(pc.yellow('No skills found to remove.'));
+    if (options.embedded && skillNames.length > 0) {
+      throw new Error(`No matching skills found for: ${skillNames.join(', ')}`);
+    }
+    if (!options.embedded) p.outro(pc.yellow('No skills found to remove.'));
     return;
   }
 
@@ -171,6 +178,9 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
     selectedSkills = resolvedRequestedSkills;
 
     if (selectedSkills.length === 0) {
+      if (options.embedded) {
+        throw new Error(`No matching skills found for: ${skillNames.join(', ')}`);
+      }
       p.log.error(`No matching skills found for: ${skillNames.join(', ')}`);
       return;
     }
@@ -201,7 +211,7 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
     // When removing, we should target all known agents to ensure
     // ghost symlinks are cleaned up, even if the agent is not detected.
     targetAgents = Object.keys(agents) as AgentType[];
-    spinner.stop(`Targeting ${targetAgents.length} potential agent(s)`);
+    spinner?.stop(`Targeting ${targetAgents.length} potential agent(s)`);
   }
 
   if (!options.yes) {
@@ -222,7 +232,7 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
     }
   }
 
-  spinner.start('Removing skills…');
+  spinner?.start('Removing skills…');
 
   const results: {
     skill: string;
@@ -269,6 +279,7 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
               await rm(pathToCleanup, { recursive: true, force: true });
             }
           } catch (err) {
+            if (options.embedded) throw err;
             p.log.warn(
               `Could not remove skill from ${agent.displayName}: ${
                 err instanceof Error ? err.message : String(err)
@@ -335,13 +346,17 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
     }
   }
 
-  spinner.stop('Removal process complete');
+  spinner?.stop('Removal process complete');
 
   const successful = results.filter((r) => r.success);
   const failed = results.filter((r) => !r.success);
 
+  if (options.embedded && failed.length > 0) {
+    throw new Error(`Failed to remove: ${failed.map((r) => `${r.skill}: ${r.error}`).join(', ')}`);
+  }
+
   // Track removal (grouped by source)
-  if (successful.length > 0) {
+  if (!options.embedded && successful.length > 0) {
     const bySource = new Map<string, { skills: string[]; sourceType?: string }>();
 
     for (const r of successful) {
@@ -364,19 +379,21 @@ export async function removeCommand(skillNames: string[], options: RemoveOptions
     }
   }
 
-  if (successful.length > 0) {
+  if (!options.embedded && successful.length > 0) {
     p.log.success(pc.green(`Successfully removed ${successful.length} skill(s)`));
   }
 
-  if (failed.length > 0) {
+  if (!options.embedded && failed.length > 0) {
     p.log.error(pc.red(`Failed to remove ${failed.length} skill(s)`));
     for (const r of failed) {
       p.log.message(`  ${pc.red('✗')} ${r.skill}: ${r.error}`);
     }
   }
 
-  console.log();
-  p.outro(pc.green('Done!'));
+  if (!options.embedded) {
+    console.log();
+    p.outro(pc.green('Done!'));
+  }
 }
 
 /**

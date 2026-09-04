@@ -13,6 +13,8 @@ const CURRENT_VERSION = 3; // Bumped from 2 to 3 for folder hash support (GitHub
 export interface SkillLockEntry {
   /** Normalized source identifier (e.g., "owner/repo", "mintlify/bun.com") */
   source: string;
+  /** Canonical source identity used to distinguish scoped catalogs. */
+  ownershipSource?: string;
   /** The provider/source type (e.g., "github", "mintlify", "huggingface", "local") */
   sourceType: string;
   /** The original URL used to install the skill (for re-fetching updates) */

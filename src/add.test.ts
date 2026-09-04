@@ -6,6 +6,10 @@ import { runCli, stripAnsi } from './test-utils.ts';
 import { shouldInstallInternalSkills } from './skills.ts';
 import {
   parseAddOptions,
+  getDeselectedEnabledSkillNames,
+  getEnabledNamesForSource,
+  getWellKnownOwnershipSource,
+  getRepositoryOwnershipSource,
   getLockSource,
   getProjectLockSourceUrl,
   formatEveInstallPromptMessage,
@@ -709,6 +713,100 @@ describe('parseAddOptions', () => {
     expect(result.source).toEqual(['source']);
     expect(result.options.subagent).toEqual(['research']);
     expect(result.options.yes).toBe(true);
+  });
+});
+
+describe('getDeselectedEnabledSkillNames', () => {
+  const skills = [{ name: 'one' }, { name: 'plugin:review' }];
+
+  it('returns only enabled skills removed from the selection', () => {
+    expect(getDeselectedEnabledSkillNames(skills, [skills[0]!], (skill) => skill.name)).toEqual([
+      'plugin:review',
+    ]);
+  });
+
+  it('matches selected names using their installed sanitized form', () => {
+    const selected = [{ name: 'plugin-review' }];
+    expect(getDeselectedEnabledSkillNames(skills, selected, (skill) => skill.name)).toEqual([
+      'one',
+    ]);
+  });
+});
+
+describe('getEnabledNamesForSource', () => {
+  it('only returns skills owned by the selected source', () => {
+    const entries = {
+      shared: { source: 'owner/other' },
+      'plugin:review': { source: 'owner/current' },
+    };
+
+    expect([...getEnabledNamesForSource(entries, 'owner/current')]).toEqual(['plugin-review']);
+  });
+
+  it('normalizes GitHub source casing', () => {
+    const entries = { skill: { source: 'Owner/Repo', sourceType: 'github' } };
+    expect([...getEnabledNamesForSource(entries, 'github:owner/repo')]).toEqual(['skill']);
+  });
+
+  it('recognizes legacy GitHub SSH lock entries', () => {
+    const entries = {
+      skill: { source: 'git@github.com:Owner/Repo.git', sourceType: 'git' },
+    };
+    expect([...getEnabledNamesForSource(entries, 'github:owner/repo')]).toEqual(['skill']);
+  });
+
+  it('recognizes legacy well-known lock URLs', () => {
+    const entries = {
+      skill: {
+        source: 'wellknown/example.com',
+        sourceType: 'well-known',
+        sourceBaseUrl: 'https://example.com/team-a/',
+      },
+    };
+    expect([...getEnabledNamesForSource(entries, 'https://example.com/team-a')]).toEqual(['skill']);
+  });
+
+  it('uses scoped ownership without exposing it as the telemetry source', () => {
+    const entries = {
+      skill: {
+        source: 'wellknown/example.com',
+        ownershipSource: 'https://example.com/team-a',
+        sourceType: 'well-known',
+      },
+    };
+    expect([...getEnabledNamesForSource(entries, 'https://example.com/team-a')]).toEqual(['skill']);
+    expect([...getEnabledNamesForSource(entries, 'https://example.com/team-b')]).toEqual([]);
+  });
+});
+
+describe('getWellKnownOwnershipSource', () => {
+  it('keeps scoped endpoints distinct while normalizing their URL', () => {
+    expect(getWellKnownOwnershipSource('HTTPS://EXAMPLE.COM/team-a/#fragment')).toBe(
+      'https://example.com/team-a'
+    );
+    expect(getWellKnownOwnershipSource('https://example.com/team-b')).toBe(
+      'https://example.com/team-b'
+    );
+  });
+});
+
+describe('getRepositoryOwnershipSource', () => {
+  it('uses the same identity for GitHub HTTPS and SSH transports', () => {
+    expect(getRepositoryOwnershipSource('https://github.com/Owner/Repo.git', 'Owner/Repo')).toBe(
+      'github:owner/repo'
+    );
+    expect(getRepositoryOwnershipSource('git@github.com:Owner/Repo.git', 'Owner/Repo')).toBe(
+      'github:owner/repo'
+    );
+    expect(
+      getRepositoryOwnershipSource('ssh://git@ssh.github.com:443/Owner/Repo.git', 'Owner/Repo')
+    ).toBe('github:owner/repo');
+  });
+
+  it('preserves transport identity for other Git hosts', () => {
+    expect(getRepositoryOwnershipSource('git@git.example.com:owner/repo.git', 'owner/repo')).toBe(
+      'git@git.example.com:owner/repo.git'
+    );
   });
 });
 
