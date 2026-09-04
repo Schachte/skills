@@ -1,7 +1,7 @@
-import { access, readdir, rename } from 'fs/promises';
-import { join } from 'path';
-import { agents } from './agents.ts';
-import { getCanonicalSkillsDir, sanitizeName } from './installer.ts';
+import { access, readdir, realpath, rename } from 'fs/promises';
+import { isAbsolute, join, relative, sep } from 'path';
+import { agents, getEveSubagents } from './agents.ts';
+import { getCanonicalSkillsDir, getEveSubagentSkillsDir, sanitizeName } from './installer.ts';
 import { parseSkillMd } from './skills.ts';
 
 const ACTIVE_FILE = 'SKILL.md';
@@ -15,6 +15,8 @@ export interface GlobalSkillState {
   hasDisabledCopies: boolean;
 }
 
+export type ProjectSkillState = GlobalSkillState;
+
 function globalSkillRoots(): string[] {
   return Array.from(
     new Set([
@@ -22,6 +24,16 @@ function globalSkillRoots(): string[] {
       ...Object.values(agents)
         .map((agent) => agent.globalSkillsDir)
         .filter((path): path is string => Boolean(path)),
+    ])
+  );
+}
+
+function projectSkillRoots(cwd: string): string[] {
+  return Array.from(
+    new Set([
+      getCanonicalSkillsDir(false, cwd),
+      ...Object.values(agents).map((agent) => join(cwd, agent.skillsDir)),
+      ...getEveSubagents(cwd).map((subagent) => getEveSubagentSkillsDir(subagent, cwd)),
     ])
   );
 }
@@ -35,7 +47,15 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function scanGlobalSkillFiles(roots: string[]): Promise<
+function isWithin(parent: string, path: string): boolean {
+  const child = relative(parent, path);
+  return child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child));
+}
+
+async function scanGlobalSkillFiles(
+  roots: string[],
+  containmentRoot?: string
+): Promise<
   Array<{
     name: string;
     description: string;
@@ -58,6 +78,15 @@ async function scanGlobalSkillFiles(roots: string[]): Promise<
     for (const entry of entries) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       const path = join(root, entry.name);
+      if (containmentRoot) {
+        let resolvedPath: string;
+        try {
+          resolvedPath = await realpath(path);
+        } catch {
+          continue;
+        }
+        if (!isWithin(containmentRoot, resolvedPath)) continue;
+      }
       const activePath = join(path, ACTIVE_FILE);
       const disabledPath = join(path, DISABLED_FILE);
       const enabled = await pathExists(activePath);
@@ -81,10 +110,11 @@ async function scanGlobalSkillFiles(roots: string[]): Promise<
 }
 
 export async function listGlobalSkillStates(
-  roots: string[] = globalSkillRoots()
+  roots: string[] = globalSkillRoots(),
+  containmentRoot?: string
 ): Promise<GlobalSkillState[]> {
   const states = new Map<string, GlobalSkillState>();
-  for (const skill of await scanGlobalSkillFiles(roots)) {
+  for (const skill of await scanGlobalSkillFiles(roots, containmentRoot)) {
     const key = sanitizeName(skill.name);
     const existing = states.get(key);
     if (existing) {
@@ -103,14 +133,19 @@ export async function listGlobalSkillStates(
   return Array.from(states.values());
 }
 
+export async function listProjectSkillStates(cwd = process.cwd()): Promise<ProjectSkillState[]> {
+  return listGlobalSkillStates(projectSkillRoots(cwd), await realpath(cwd));
+}
+
 export async function setGlobalSkillEnabled(
   name: string,
   enabled: boolean,
-  roots: string[] = globalSkillRoots()
+  roots: string[] = globalSkillRoots(),
+  containmentRoot?: string
 ): Promise<number> {
   const targetName = sanitizeName(name);
   let changed = 0;
-  const skills = (await scanGlobalSkillFiles(roots)).filter(
+  const skills = (await scanGlobalSkillFiles(roots, containmentRoot)).filter(
     (skill) => sanitizeName(skill.name) === targetName
   );
   for (const skill of skills) {
@@ -127,4 +162,12 @@ export async function setGlobalSkillEnabled(
     changed += 1;
   }
   return changed;
+}
+
+export async function setProjectSkillEnabled(
+  name: string,
+  enabled: boolean,
+  cwd = process.cwd()
+): Promise<number> {
+  return setGlobalSkillEnabled(name, enabled, projectSkillRoots(cwd), await realpath(cwd));
 }

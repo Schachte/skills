@@ -3970,6 +3970,13 @@ const DISABLED_FILE = "SKILL.md.disabled";
 function globalSkillRoots() {
 	return Array.from(/* @__PURE__ */ new Set([getCanonicalSkillsDir(true), ...Object.values(agents).map((agent) => agent.globalSkillsDir).filter((path) => Boolean(path))]));
 }
+function projectSkillRoots(cwd) {
+	return Array.from(/* @__PURE__ */ new Set([
+		getCanonicalSkillsDir(false, cwd),
+		...Object.values(agents).map((agent) => join(cwd, agent.skillsDir)),
+		...getEveSubagents(cwd).map((subagent) => getEveSubagentSkillsDir(subagent, cwd))
+	]));
+}
 async function pathExists(path) {
 	try {
 		await access(path);
@@ -3978,7 +3985,11 @@ async function pathExists(path) {
 		return false;
 	}
 }
-async function scanGlobalSkillFiles(roots) {
+function isWithin(parent, path) {
+	const child = relative(parent, path);
+	return child === "" || child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child);
+}
+async function scanGlobalSkillFiles(roots, containmentRoot) {
 	const results = [];
 	for (const root of roots) {
 		let entries;
@@ -3990,6 +4001,15 @@ async function scanGlobalSkillFiles(roots) {
 		for (const entry of entries) {
 			if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
 			const path = join(root, entry.name);
+			if (containmentRoot) {
+				let resolvedPath;
+				try {
+					resolvedPath = await realpath(path);
+				} catch {
+					continue;
+				}
+				if (!isWithin(containmentRoot, resolvedPath)) continue;
+			}
 			const activePath = join(path, ACTIVE_FILE);
 			const disabledPath = join(path, DISABLED_FILE);
 			const enabled = await pathExists(activePath);
@@ -4011,9 +4031,9 @@ async function scanGlobalSkillFiles(roots) {
 	}
 	return results;
 }
-async function listGlobalSkillStates(roots = globalSkillRoots()) {
+async function listGlobalSkillStates(roots = globalSkillRoots(), containmentRoot) {
 	const states = /* @__PURE__ */ new Map();
-	for (const skill of await scanGlobalSkillFiles(roots)) {
+	for (const skill of await scanGlobalSkillFiles(roots, containmentRoot)) {
 		const key = sanitizeName(skill.name);
 		const existing = states.get(key);
 		if (existing) {
@@ -4031,10 +4051,13 @@ async function listGlobalSkillStates(roots = globalSkillRoots()) {
 	}
 	return Array.from(states.values());
 }
-async function setGlobalSkillEnabled(name, enabled, roots = globalSkillRoots()) {
+async function listProjectSkillStates(cwd = process.cwd()) {
+	return listGlobalSkillStates(projectSkillRoots(cwd), await realpath(cwd));
+}
+async function setGlobalSkillEnabled(name, enabled, roots = globalSkillRoots(), containmentRoot) {
 	const targetName = sanitizeName(name);
 	let changed = 0;
-	const skills = (await scanGlobalSkillFiles(roots)).filter((skill) => sanitizeName(skill.name) === targetName);
+	const skills = (await scanGlobalSkillFiles(roots, containmentRoot)).filter((skill) => sanitizeName(skill.name) === targetName);
 	for (const skill of skills) if (skill.enabled && skill.disabled) throw new Error(`Cannot toggle ${name}: both ${ACTIVE_FILE} and ${DISABLED_FILE} exist`);
 	for (const skill of skills) {
 		if (skill.enabled === enabled) continue;
@@ -4045,6 +4068,9 @@ async function setGlobalSkillEnabled(name, enabled, roots = globalSkillRoots()) 
 		changed += 1;
 	}
 	return changed;
+}
+async function setProjectSkillEnabled(name, enabled, cwd = process.cwd()) {
+	return setGlobalSkillEnabled(name, enabled, projectSkillRoots(cwd), await realpath(cwd));
 }
 const DOWNLOAD_BASE_URL = process.env.SKILLS_DOWNLOAD_URL || "https://skills.sh";
 const BLOB_ALLOWED_REPOS = { "zapier/connectors": { downloadUrl: (slug) => `https://connectors-skills.zapier.com/download/${encodeURIComponent(slug)}/snapshot.json` } };
@@ -4635,7 +4661,7 @@ async function externalInstalledSkillsForSource(global, managesEnabledState, sou
 }
 async function projectInstalledSkillsForCwd(managesEnabledState) {
 	if (!managesEnabledState) return [];
-	return listInstalledSkills({ global: false });
+	return listProjectSkillStates();
 }
 function getProjectSkillChoices(projectSkills) {
 	return [...projectSkills].sort((a, b) => a.name.localeCompare(b.name)).map((skill) => ({
@@ -4643,20 +4669,23 @@ function getProjectSkillChoices(projectSkills) {
 		label: skill.name,
 		hint: skill.description.length > 60 ? skill.description.slice(0, 57) + "…" : skill.description,
 		detail: `${skill.description || "Installed skill"} (${skill.path})`,
-		status: "project",
-		readOnly: true
+		status: "project"
 	}));
 }
-function getExternalSkillStateChanges(externalSkills, selectedValues) {
+function getSkillStateChanges(skills, selectedValues) {
 	const selected = new Set(selectedValues);
 	return {
-		enable: externalSkills.filter((skill) => skill.hasDisabledCopies && selected.has(skill)).map((s) => s.name),
-		disable: externalSkills.filter((skill) => skill.enabled && !selected.has(skill)).map((s) => s.name)
+		enable: skills.filter((skill) => skill.hasDisabledCopies && selected.has(skill)).map((s) => s.name),
+		disable: skills.filter((skill) => skill.enabled && !selected.has(skill)).map((s) => s.name)
 	};
 }
 async function applyExternalSkillStateChanges(changes) {
 	for (const name of changes.disable) await setGlobalSkillEnabled(name, false);
 	for (const name of changes.enable) await setGlobalSkillEnabled(name, true);
+}
+async function applyProjectSkillStateChanges(changes) {
+	for (const name of changes.disable) await setProjectSkillEnabled(name, false);
+	for (const name of changes.enable) await setProjectSkillEnabled(name, true);
 }
 function isGitHubSshSource(source) {
 	if (/^git@github\.com:/i.test(source)) return true;
@@ -4755,8 +4784,13 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 	const externalSkills = await externalInstalledSkillsForSource(installGlobally, managesEnabledState, ownershipSource);
 	const projectSkills = await projectInstalledSkillsForCwd(managesEnabledState);
 	const externalSkillsByName = new Map(externalSkills.map((skill) => [sanitizeName(skill.name), skill]));
+	const projectSkillsByName = new Map(projectSkills.map((skill) => [sanitizeName(skill.name), skill]));
 	let skillsToDisable = [];
 	let externalChanges = {
+		enable: [],
+		disable: []
+	};
+	let projectChanges = {
 		enable: [],
 		disable: []
 	};
@@ -4772,7 +4806,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 			for (const s of skills) log.message(`  - ${s.installName}`);
 			process.exit(1);
 		}
-	} else if (skills.length === 1 && enabledSkills.length === 0 && externalSkills.length === 0) {
+	} else if (skills.length === 1 && enabledSkills.length === 0 && externalSkills.length === 0 && projectSkills.length === 0) {
 		selectedSkills = skills;
 		const firstSkill = skills[0];
 		log.info(`Skill: ${import_picocolors.default.cyan(firstSkill.installName)}`);
@@ -4783,7 +4817,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 		const sourceSkillNames = new Set(skills.map((skill) => sanitizeName(skill.installName)));
 		const skillChoices = [
 			...getProjectSkillChoices(projectSkills),
-			...skills.map((s) => {
+			...skills.filter((skill) => installGlobally || !projectSkillsByName.has(sanitizeName(skill.installName))).map((s) => {
 				const external = externalSkillsByName.get(sanitizeName(s.installName));
 				return {
 					value: external ?? s,
@@ -4804,7 +4838,15 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 		const selected = await searchMultiselect({
 			message: `Select enabled ${installGlobally ? "global" : "project"} skills`,
 			items: skillChoices,
-			initialSelected: isSkillsShPackUrl(url) ? Array.from(/* @__PURE__ */ new Set([...skills.filter((skill) => !externalSkillsByName.has(sanitizeName(skill.installName))), ...externalSkills.filter((skill) => skill.enabled)])) : [...enabledSkills.filter((skill) => !externalSkillsByName.has(sanitizeName(skill.installName))), ...externalSkills.filter((skill) => skill.enabled)],
+			initialSelected: isSkillsShPackUrl(url) ? Array.from(/* @__PURE__ */ new Set([
+				...skills.filter((skill) => !externalSkillsByName.has(sanitizeName(skill.installName)) && (installGlobally || !projectSkillsByName.has(sanitizeName(skill.installName)))),
+				...externalSkills.filter((skill) => skill.enabled),
+				...projectSkills.filter((skill) => skill.enabled)
+			])) : [
+				...enabledSkills.filter((skill) => !externalSkillsByName.has(sanitizeName(skill.installName)) && (installGlobally || !projectSkillsByName.has(sanitizeName(skill.installName)))),
+				...externalSkills.filter((skill) => skill.enabled),
+				...projectSkills.filter((skill) => skill.enabled)
+			],
 			required: false,
 			maxVisible: 20,
 			selectAll: true
@@ -4815,18 +4857,21 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 		}
 		const selectedValues = selected;
 		selectedSkills = selectedValues.filter((skill) => skills.includes(skill));
-		externalChanges = getExternalSkillStateChanges(externalSkills, selectedValues);
-		skillsToDisable = getDeselectedEnabledSkillNames(enabledSkills, selectedSkills, (skill) => skill.installName, externalSkills.map((skill) => skill.name));
+		externalChanges = getSkillStateChanges(externalSkills, selectedValues);
+		projectChanges = getSkillStateChanges(projectSkills, selectedValues);
+		skillsToDisable = getDeselectedEnabledSkillNames(enabledSkills, selectedSkills, (skill) => skill.installName, [...externalSkills.map((skill) => skill.name), ...installGlobally ? [] : projectSkills.map((skill) => skill.name)]);
 	}
 	if (selectedSkills.length === 0) {
-		if (skillsToDisable.length === 0 && externalChanges.enable.length === 0 && externalChanges.disable.length === 0) {
+		if (skillsToDisable.length === 0 && externalChanges.enable.length === 0 && externalChanges.disable.length === 0 && projectChanges.enable.length === 0 && projectChanges.disable.length === 0) {
 			outro(import_picocolors.default.dim("No changes."));
 			return true;
 		}
 		note([
 			...skillsToDisable.map((name) => import_picocolors.default.red(`Disable ${name}`)),
 			...externalChanges.disable.map((name) => import_picocolors.default.red(`Disable external ${name}`)),
-			...externalChanges.enable.map((name) => import_picocolors.default.green(`Enable external ${name}`))
+			...externalChanges.enable.map((name) => import_picocolors.default.green(`Enable external ${name}`)),
+			...projectChanges.disable.map((name) => import_picocolors.default.red(`Disable project ${name}`)),
+			...projectChanges.enable.map((name) => import_picocolors.default.green(`Enable project ${name}`))
 		].join("\n"), "Changes Summary");
 		const confirmed = await confirm({ message: "Apply changes?" });
 		if (isCancel(confirmed) || !confirmed) {
@@ -4835,6 +4880,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 		}
 		await applySkillRemovals(skillsToDisable, installGlobally);
 		await applyExternalSkillStateChanges(externalChanges);
+		await applyProjectSkillStateChanges(projectChanges);
 		outro(import_picocolors.default.green("Done!"));
 		return true;
 	}
@@ -4956,7 +5002,17 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 		summaryLines.push(import_picocolors.default.bold("Enable external"));
 		for (const name of externalChanges.enable) summaryLines.push(`  ${import_picocolors.default.green(name)}`);
 	}
-	const hasStateChanges = skillsToDisable.length > 0 || externalChanges.disable.length > 0 || externalChanges.enable.length > 0;
+	if (projectChanges.disable.length > 0) {
+		if (summaryLines.length > 0) summaryLines.push("");
+		summaryLines.push(import_picocolors.default.bold("Disable project"));
+		for (const name of projectChanges.disable) summaryLines.push(`  ${import_picocolors.default.red(name)}`);
+	}
+	if (projectChanges.enable.length > 0) {
+		if (summaryLines.length > 0) summaryLines.push("");
+		summaryLines.push(import_picocolors.default.bold("Enable project"));
+		for (const name of projectChanges.enable) summaryLines.push(`  ${import_picocolors.default.green(name)}`);
+	}
+	const hasStateChanges = skillsToDisable.length > 0 || externalChanges.disable.length > 0 || externalChanges.enable.length > 0 || projectChanges.disable.length > 0 || projectChanges.enable.length > 0;
 	console.log();
 	note(summaryLines.join("\n"), hasStateChanges ? "Changes Summary" : "Installation Summary");
 	if (!options.yes) {
@@ -4987,6 +5043,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 	if (failed.length === 0) {
 		await applySkillRemovals(skillsToDisable, installGlobally);
 		await applyExternalSkillStateChanges(externalChanges);
+		await applyProjectSkillStateChanges(projectChanges);
 	} else if (hasStateChanges) log.warn("Skipped disabling skills because installation did not complete successfully.");
 	const skillFiles = {};
 	for (const skill of selectedSkills) skillFiles[skill.installName] = skill.sourceUrl;
@@ -5261,8 +5318,13 @@ async function runAdd(args, options = {}) {
 		const externalSkills = await externalInstalledSkillsForSource(installGlobally, managesEnabledState, ownershipSource);
 		const projectSkills = await projectInstalledSkillsForCwd(managesEnabledState);
 		const externalSkillsByName = new Map(externalSkills.map((skill) => [sanitizeName(skill.name), skill]));
+		const projectSkillsByName = new Map(projectSkills.map((skill) => [sanitizeName(skill.name), skill]));
 		let skillsToDisable = [];
 		let externalChanges = {
+			enable: [],
+			disable: []
+		};
+		let projectChanges = {
 			enable: [],
 			disable: []
 		};
@@ -5280,7 +5342,7 @@ async function runAdd(args, options = {}) {
 				process.exit(1);
 			}
 			log.info(`Selected ${selectedSkills.length} skill${selectedSkills.length !== 1 ? "s" : ""}: ${selectedSkills.map((s) => import_picocolors.default.cyan(getSkillDisplayName(s))).join(", ")}`);
-		} else if (skills.length === 1 && enabledSkills.length === 0 && externalSkills.length === 0) {
+		} else if (skills.length === 1 && enabledSkills.length === 0 && externalSkills.length === 0 && projectSkills.length === 0) {
 			selectedSkills = skills;
 			const firstSkill = skills[0];
 			log.info(`Skill: ${import_picocolors.default.cyan(getSkillDisplayName(firstSkill))}`);
@@ -5300,7 +5362,7 @@ async function runAdd(args, options = {}) {
 			const sourceSkillNames = new Set(sortedSkills.map((skill) => sanitizeName(skill.name)));
 			const skillChoices = [
 				...getProjectSkillChoices(projectSkills),
-				...sortedSkills.map((s) => {
+				...sortedSkills.filter((skill) => installGlobally || !projectSkillsByName.has(sanitizeName(skill.name))).map((s) => {
 					const external = externalSkillsByName.get(sanitizeName(s.name));
 					return {
 						value: external ?? s,
@@ -5320,7 +5382,11 @@ async function runAdd(args, options = {}) {
 			const selected = await searchMultiselect({
 				message: hasGroups ? `Select enabled ${installGlobally ? "global" : "project"} skills ${import_picocolors.default.dim("(space to toggle)")}` : `Select enabled ${installGlobally ? "global" : "project"} skills`,
 				items: skillChoices,
-				initialSelected: [...enabledSkills.filter((skill) => !externalSkillsByName.has(sanitizeName(skill.name))), ...externalSkills.filter((skill) => skill.enabled)],
+				initialSelected: [
+					...enabledSkills.filter((skill) => !externalSkillsByName.has(sanitizeName(skill.name)) && (installGlobally || !projectSkillsByName.has(sanitizeName(skill.name)))),
+					...externalSkills.filter((skill) => skill.enabled),
+					...projectSkills.filter((skill) => skill.enabled)
+				],
 				required: false,
 				maxVisible: 20,
 				searchable: !hasGroups,
@@ -5336,11 +5402,12 @@ async function runAdd(args, options = {}) {
 			}
 			const selectedValues = selected;
 			selectedSkills = selectedValues.filter((skill) => skills.includes(skill));
-			externalChanges = getExternalSkillStateChanges(externalSkills, selectedValues);
-			skillsToDisable = getDeselectedEnabledSkillNames(enabledSkills, selectedSkills, (skill) => skill.name, externalSkills.map((skill) => skill.name));
+			externalChanges = getSkillStateChanges(externalSkills, selectedValues);
+			projectChanges = getSkillStateChanges(projectSkills, selectedValues);
+			skillsToDisable = getDeselectedEnabledSkillNames(enabledSkills, selectedSkills, (skill) => skill.name, [...externalSkills.map((skill) => skill.name), ...installGlobally ? [] : projectSkills.map((skill) => skill.name)]);
 		}
 		if (selectedSkills.length === 0) {
-			if (skillsToDisable.length === 0 && externalChanges.enable.length === 0 && externalChanges.disable.length === 0) {
+			if (skillsToDisable.length === 0 && externalChanges.enable.length === 0 && externalChanges.disable.length === 0 && projectChanges.enable.length === 0 && projectChanges.disable.length === 0) {
 				outro(import_picocolors.default.dim("No changes."));
 				await cleanup(tempDir);
 				return;
@@ -5348,7 +5415,9 @@ async function runAdd(args, options = {}) {
 			note([
 				...skillsToDisable.map((name) => import_picocolors.default.red(`Disable ${name}`)),
 				...externalChanges.disable.map((name) => import_picocolors.default.red(`Disable external ${name}`)),
-				...externalChanges.enable.map((name) => import_picocolors.default.green(`Enable external ${name}`))
+				...externalChanges.enable.map((name) => import_picocolors.default.green(`Enable external ${name}`)),
+				...projectChanges.disable.map((name) => import_picocolors.default.red(`Disable project ${name}`)),
+				...projectChanges.enable.map((name) => import_picocolors.default.green(`Enable project ${name}`))
 			].join("\n"), "Changes Summary");
 			const confirmed = await confirm({ message: "Apply changes?" });
 			if (isCancel(confirmed) || !confirmed) {
@@ -5358,6 +5427,7 @@ async function runAdd(args, options = {}) {
 			}
 			await applySkillRemovals(skillsToDisable, installGlobally);
 			await applyExternalSkillStateChanges(externalChanges);
+			await applyProjectSkillStateChanges(projectChanges);
 			outro(import_picocolors.default.green("Done!"));
 			await cleanup(tempDir);
 			return;
@@ -5567,7 +5637,17 @@ async function runAdd(args, options = {}) {
 			summaryLines.push(import_picocolors.default.bold("Enable external"));
 			for (const name of externalChanges.enable) summaryLines.push(`  ${import_picocolors.default.green(name)}`);
 		}
-		const hasStateChanges = skillsToDisable.length > 0 || externalChanges.disable.length > 0 || externalChanges.enable.length > 0;
+		if (projectChanges.disable.length > 0) {
+			if (summaryLines.length > 0) summaryLines.push("");
+			summaryLines.push(import_picocolors.default.bold("Disable project"));
+			for (const name of projectChanges.disable) summaryLines.push(`  ${import_picocolors.default.red(name)}`);
+		}
+		if (projectChanges.enable.length > 0) {
+			if (summaryLines.length > 0) summaryLines.push("");
+			summaryLines.push(import_picocolors.default.bold("Enable project"));
+			for (const name of projectChanges.enable) summaryLines.push(`  ${import_picocolors.default.green(name)}`);
+		}
+		const hasStateChanges = skillsToDisable.length > 0 || externalChanges.disable.length > 0 || externalChanges.enable.length > 0 || projectChanges.disable.length > 0 || projectChanges.enable.length > 0;
 		console.log();
 		note(summaryLines.join("\n"), hasStateChanges ? "Changes Summary" : "Installation Summary");
 		try {
@@ -5622,6 +5702,7 @@ async function runAdd(args, options = {}) {
 		if (failed.length === 0) {
 			await applySkillRemovals(skillsToDisable, installGlobally);
 			await applyExternalSkillStateChanges(externalChanges);
+			await applyProjectSkillStateChanges(projectChanges);
 		} else if (hasStateChanges) log.warn("Skipped disabling skills because installation did not complete successfully.");
 		const skillFiles = {};
 		for (const skill of selectedSkills) if (blobResult && "repoPath" in skill) skillFiles[skill.name] = skill.repoPath;

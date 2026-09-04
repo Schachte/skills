@@ -9,7 +9,7 @@ import {
   getDeselectedEnabledSkillNames,
   getEnabledNamesForSource,
   getExternalInstalledSkills,
-  getExternalSkillStateChanges,
+  getSkillStateChanges,
   getProjectSkillChoices,
   getWellKnownOwnershipSource,
   getRepositoryOwnershipSource,
@@ -820,7 +820,7 @@ describe('getExternalInstalledSkills', () => {
   });
 });
 
-describe('getExternalSkillStateChanges', () => {
+describe('getSkillStateChanges', () => {
   const enabled = {
     name: 'enabled',
     description: '',
@@ -837,14 +837,14 @@ describe('getExternalSkillStateChanges', () => {
   };
 
   it('disables every enabled external skill when none are selected', () => {
-    expect(getExternalSkillStateChanges([enabled, disabled], [])).toEqual({
+    expect(getSkillStateChanges([enabled, disabled], [])).toEqual({
       enable: [],
       disable: ['enabled'],
     });
   });
 
   it('enables disabled external skills when selected', () => {
-    expect(getExternalSkillStateChanges([enabled, disabled], [enabled, disabled])).toEqual({
+    expect(getSkillStateChanges([enabled, disabled], [enabled, disabled])).toEqual({
       enable: ['disabled'],
       disable: [],
     });
@@ -852,7 +852,7 @@ describe('getExternalSkillStateChanges', () => {
 
   it('restores disabled copies when an external skill is partially enabled', () => {
     const partial = { ...enabled, hasDisabledCopies: true };
-    expect(getExternalSkillStateChanges([partial], [partial])).toEqual({
+    expect(getSkillStateChanges([partial], [partial])).toEqual({
       enable: ['enabled'],
       disable: [],
     });
@@ -860,14 +860,13 @@ describe('getExternalSkillStateChanges', () => {
 });
 
 describe('getProjectSkillChoices', () => {
-  it('labels cwd project skills and keeps them read-only', () => {
+  it('labels cwd project skills and keeps them selectable', () => {
     const skill = {
       name: 'local-skill',
       description: 'Local skill',
       path: '/project/.agents/skills/local-skill',
-      canonicalPath: '/project/.agents/skills/local-skill',
-      scope: 'project' as const,
-      agents: [],
+      enabled: true,
+      hasDisabledCopies: false,
     };
 
     expect(getProjectSkillChoices([skill])).toMatchObject([
@@ -875,9 +874,9 @@ describe('getProjectSkillChoices', () => {
         value: skill,
         label: 'local-skill',
         status: 'project',
-        readOnly: true,
       },
     ]);
+    expect(getProjectSkillChoices([skill])[0]).not.toHaveProperty('readOnly');
   });
 
   it('sorts project skills for stable placement at the top of the selector', () => {
@@ -885,9 +884,8 @@ describe('getProjectSkillChoices', () => {
       name,
       description: name,
       path: `/project/.agents/skills/${name}`,
-      canonicalPath: `/project/.agents/skills/${name}`,
-      scope: 'project' as const,
-      agents: [],
+      enabled: true,
+      hasDisabledCopies: false,
     });
 
     expect(

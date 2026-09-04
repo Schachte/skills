@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { listGlobalSkillStates, setGlobalSkillEnabled } from './global-skill-state.ts';
+import {
+  listGlobalSkillStates,
+  listProjectSkillStates,
+  setGlobalSkillEnabled,
+  setProjectSkillEnabled,
+} from './global-skill-state.ts';
 
 const created: string[] = [];
 
@@ -88,5 +93,52 @@ describe('global skill state', () => {
       'both SKILL.md and SKILL.md.disabled exist'
     );
     expect(existsSync(join(skillA, 'SKILL.md'))).toBe(true);
+  });
+});
+
+describe('project skill state', () => {
+  it('disables and restores copies across cwd harness directories', async () => {
+    const cwd = join(tmpdir(), `project-skills-${Date.now()}`);
+    created.push(cwd);
+    const canonical = createSkill(join(cwd, '.agents', 'skills'), 'local-skill');
+    const claude = createSkill(join(cwd, '.claude', 'skills'), 'local-skill');
+
+    expect(await setProjectSkillEnabled('local-skill', false, cwd)).toBe(2);
+    expect(existsSync(join(canonical, 'SKILL.md.disabled'))).toBe(true);
+    expect(existsSync(join(claude, 'SKILL.md.disabled'))).toBe(true);
+    expect(existsSync(join(canonical, 'support.txt'))).toBe(true);
+    expect(await listProjectSkillStates(cwd)).toMatchObject([
+      { name: 'local-skill', enabled: false, hasDisabledCopies: true },
+    ]);
+
+    expect(await setProjectSkillEnabled('local-skill', true, cwd)).toBe(2);
+    expect(existsSync(join(canonical, 'SKILL.md'))).toBe(true);
+    expect(existsSync(join(claude, 'SKILL.md'))).toBe(true);
+  });
+
+  it('includes Eve subagent skill copies', async () => {
+    const cwd = join(tmpdir(), `project-eve-skills-${Date.now()}`);
+    created.push(cwd);
+    const skill = createSkill(join(cwd, 'agent', 'subagents', 'research', 'skills'), 'eve-skill');
+
+    expect(await setProjectSkillEnabled('eve-skill', false, cwd)).toBe(1);
+    expect(existsSync(join(skill, 'SKILL.md.disabled'))).toBe(true);
+    expect(await listProjectSkillStates(cwd)).toMatchObject([
+      { name: 'eve-skill', enabled: false },
+    ]);
+  });
+
+  it('does not follow project skill links outside the cwd', async () => {
+    const cwd = join(tmpdir(), `project-contained-${Date.now()}`);
+    const outside = join(tmpdir(), `project-outside-${Date.now()}`);
+    created.push(cwd, outside);
+    const outsideSkill = createSkill(outside, 'escaped');
+    const projectSkills = join(cwd, '.agents', 'skills');
+    mkdirSync(projectSkills, { recursive: true });
+    symlinkSync(outsideSkill, join(projectSkills, 'escaped'), 'dir');
+
+    expect(await listProjectSkillStates(cwd)).toEqual([]);
+    expect(await setProjectSkillEnabled('escaped', false, cwd)).toBe(0);
+    expect(existsSync(join(outsideSkill, 'SKILL.md'))).toBe(true);
   });
 });
