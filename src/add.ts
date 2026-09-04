@@ -884,6 +884,7 @@ async function handleWellKnownSkills(
     // Prompt user to select skills
     const sourceSkillNames = new Set(skills.map((skill) => sanitizeName(skill.installName)));
     const skillChoices = [
+      ...getProjectSkillChoices(projectSkills),
       ...skills.map((s) => {
         const external = externalSkillsByName.get(sanitizeName(s.installName));
         return {
@@ -911,7 +912,6 @@ async function handleWellKnownSkills(
           detail: `${skill.description || 'Installed skill'} (${skill.path})`,
           status: 'external',
         })),
-      ...getProjectSkillChoices(projectSkills),
     ];
 
     const selected = await searchMultiselect<WellKnownSkill | GlobalSkillState | InstalledSkill>({
@@ -1705,6 +1705,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
       const sourceSkillNames = new Set(sortedSkills.map((skill) => sanitizeName(skill.name)));
       const skillChoices = [
+        ...getProjectSkillChoices(projectSkills),
         ...sortedSkills.map((s) => {
           const external = externalSkillsByName.get(sanitizeName(s.name));
           return {
@@ -1724,7 +1725,6 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             detail: `${skill.description || 'Installed skill'} (${skill.path})`,
             status: 'external',
           })),
-        ...getProjectSkillChoices(projectSkills),
       ];
 
       const selected = await searchMultiselect<Skill | GlobalSkillState | InstalledSkill>({

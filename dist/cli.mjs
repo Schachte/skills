@@ -4782,6 +4782,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 	} else {
 		const sourceSkillNames = new Set(skills.map((skill) => sanitizeName(skill.installName)));
 		const skillChoices = [
+			...getProjectSkillChoices(projectSkills),
 			...skills.map((s) => {
 				const external = externalSkillsByName.get(sanitizeName(s.installName));
 				return {
@@ -4798,8 +4799,7 @@ async function handleWellKnownSkills(source, url, options, spinner) {
 				hint: skill.description.length > 60 ? skill.description.slice(0, 57) + "…" : skill.description,
 				detail: `${skill.description || "Installed skill"} (${skill.path})`,
 				status: "external"
-			})),
-			...getProjectSkillChoices(projectSkills)
+			}))
 		];
 		const selected = await searchMultiselect({
 			message: `Select enabled ${installGlobally ? "global" : "project"} skills`,
@@ -5299,6 +5299,7 @@ async function runAdd(args, options = {}) {
 			const kebabToTitle = (s) => s.split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 			const sourceSkillNames = new Set(sortedSkills.map((skill) => sanitizeName(skill.name)));
 			const skillChoices = [
+				...getProjectSkillChoices(projectSkills),
 				...sortedSkills.map((s) => {
 					const external = externalSkillsByName.get(sanitizeName(s.name));
 					return {
@@ -5314,8 +5315,7 @@ async function runAdd(args, options = {}) {
 					label: skill.name,
 					detail: `${skill.description || "Installed skill"} (${skill.path})`,
 					status: "external"
-				})),
-				...getProjectSkillChoices(projectSkills)
+				}))
 			];
 			const selected = await searchMultiselect({
 				message: hasGroups ? `Select enabled ${installGlobally ? "global" : "project"} skills ${import_picocolors.default.dim("(space to toggle)")}` : `Select enabled ${installGlobally ? "global" : "project"} skills`,

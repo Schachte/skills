@@ -879,6 +879,21 @@ describe('getProjectSkillChoices', () => {
       },
     ]);
   });
+
+  it('sorts project skills for stable placement at the top of the selector', () => {
+    const skill = (name: string) => ({
+      name,
+      description: name,
+      path: `/project/.agents/skills/${name}`,
+      canonicalPath: `/project/.agents/skills/${name}`,
+      scope: 'project' as const,
+      agents: [],
+    });
+
+    expect(
+      getProjectSkillChoices([skill('z-last'), skill('a-first')]).map((item) => item.label)
+    ).toEqual(['a-first', 'z-last']);
+  });
 });
 
 describe('getWellKnownOwnershipSource', () => {
